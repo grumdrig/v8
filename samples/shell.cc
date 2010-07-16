@@ -159,9 +159,10 @@ v8::Handle<v8::Value> Read(const v8::Arguments& args) {
   return source;
 }
 
-// The callback that is invoked by v8 whenever the JavaScript 'read'
-// function is called.  This function loads the content of the file named in
-// the argument into a JavaScript string.
+// The callback that is invoked by v8 whenever the JavaScript 'write'
+// function is called. This function writes the string in the second
+// argument to the file named in the first argument (truncating any
+// existing file).
 v8::Handle<v8::Value> Write(const v8::Arguments& args) {
   if (args.Length() != 2) {
     return v8::ThrowException(v8::String::New("Bad parameters"));
