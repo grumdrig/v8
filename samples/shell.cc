@@ -39,6 +39,7 @@ bool ExecuteString(v8::Handle<v8::String> source,
                    bool report_exceptions);
 v8::Handle<v8::Value> Print(const v8::Arguments& args);
 v8::Handle<v8::Value> Read(const v8::Arguments& args);
+v8::Handle<v8::Value> Write(const v8::Arguments& args);
 v8::Handle<v8::Value> Load(const v8::Arguments& args);
 v8::Handle<v8::Value> Quit(const v8::Arguments& args);
 v8::Handle<v8::Value> Version(const v8::Arguments& args);
@@ -55,6 +56,8 @@ int RunMain(int argc, char* argv[]) {
   global->Set(v8::String::New("print"), v8::FunctionTemplate::New(Print));
   // Bind the global 'read' function to the C++ Read callback.
   global->Set(v8::String::New("read"), v8::FunctionTemplate::New(Read));
+  // Bind the global 'write' function to the C++ Write callback.
+  global->Set(v8::String::New("write"), v8::FunctionTemplate::New(Write));
   // Bind the global 'load' function to the C++ Load callback.
   global->Set(v8::String::New("load"), v8::FunctionTemplate::New(Load));
   // Bind the 'quit' function
@@ -154,6 +157,29 @@ v8::Handle<v8::Value> Read(const v8::Arguments& args) {
     return v8::ThrowException(v8::String::New("Error loading file"));
   }
   return source;
+}
+
+// The callback that is invoked by v8 whenever the JavaScript 'read'
+// function is called.  This function loads the content of the file named in
+// the argument into a JavaScript string.
+v8::Handle<v8::Value> Write(const v8::Arguments& args) {
+  if (args.Length() != 2) {
+    return v8::ThrowException(v8::String::New("Bad parameters"));
+  }
+  v8::String::Utf8Value filename(args[0]);
+  if (*filename == NULL) {
+    return v8::ThrowException(v8::String::New("Error writing file"));
+  } else {
+    v8::HandleScope handle_scope;
+
+    v8::String::Utf8Value str(args[1]);
+    const char* cstr = ToCString(str);
+
+    FILE* file = fopen(*filename, "wb");
+    fwrite(cstr, 1, strlen(cstr), file);
+    fclose(file);
+  }
+  return v8::Undefined();
 }
 
 
