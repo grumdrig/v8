@@ -64,7 +64,9 @@ Address RelocInfo::target_address() {
 
 
 Address RelocInfo::target_address_address() {
-  ASSERT(IsCodeTarget(rmode_) || rmode_ == RUNTIME_ENTRY);
+  ASSERT(IsCodeTarget(rmode_) || rmode_ == RUNTIME_ENTRY
+                              || rmode_ == EMBEDDED_OBJECT
+                              || rmode_ == EXTERNAL_REFERENCE);
   return reinterpret_cast<Address>(Assembler::target_address_address_at(pc_));
 }
 
@@ -74,9 +76,14 @@ int RelocInfo::target_address_size() {
 }
 
 
-void RelocInfo::set_target_address(Address target) {
+void RelocInfo::set_target_address(Address target, WriteBarrierMode mode) {
   ASSERT(IsCodeTarget(rmode_) || rmode_ == RUNTIME_ENTRY);
   Assembler::set_target_address_at(pc_, target);
+  if (mode == UPDATE_WRITE_BARRIER && host() != NULL && IsCodeTarget(rmode_)) {
+    Object* target_code = Code::GetCodeFromTargetAddress(target);
+    host()->GetHeap()->incremental_marking()->RecordWriteIntoCode(
+        host(), this, HeapObject::cast(target_code));
+  }
 }
 
 
@@ -98,15 +105,52 @@ Object** RelocInfo::target_object_address() {
 }
 
 
-void RelocInfo::set_target_object(Object* target) {
+void RelocInfo::set_target_object(Object* target, WriteBarrierMode mode) {
   ASSERT(IsCodeTarget(rmode_) || rmode_ == EMBEDDED_OBJECT);
   Assembler::set_target_address_at(pc_, reinterpret_cast<Address>(target));
+  if (mode == UPDATE_WRITE_BARRIER &&
+      host() != NULL &&
+      target->IsHeapObject()) {
+    host()->GetHeap()->incremental_marking()->RecordWrite(
+        host(), &Memory::Object_at(pc_), HeapObject::cast(target));
+  }
 }
 
 
 Address* RelocInfo::target_reference_address() {
   ASSERT(rmode_ == EXTERNAL_REFERENCE);
   return reinterpret_cast<Address*>(Assembler::target_address_address_at(pc_));
+}
+
+
+Handle<JSGlobalPropertyCell> RelocInfo::target_cell_handle() {
+  ASSERT(rmode_ == RelocInfo::GLOBAL_PROPERTY_CELL);
+  Address address = Memory::Address_at(pc_);
+  return Handle<JSGlobalPropertyCell>(
+      reinterpret_cast<JSGlobalPropertyCell**>(address));
+}
+
+
+JSGlobalPropertyCell* RelocInfo::target_cell() {
+  ASSERT(rmode_ == RelocInfo::GLOBAL_PROPERTY_CELL);
+  Address address = Memory::Address_at(pc_);
+  Object* object = HeapObject::FromAddress(
+      address - JSGlobalPropertyCell::kValueOffset);
+  return reinterpret_cast<JSGlobalPropertyCell*>(object);
+}
+
+
+void RelocInfo::set_target_cell(JSGlobalPropertyCell* cell,
+                                WriteBarrierMode mode) {
+  ASSERT(rmode_ == RelocInfo::GLOBAL_PROPERTY_CELL);
+  Address address = cell->address() + JSGlobalPropertyCell::kValueOffset;
+  Memory::Address_at(pc_) = address;
+  if (mode == UPDATE_WRITE_BARRIER && host() != NULL) {
+    // TODO(1550) We are passing NULL as a slot because cell can never be on
+    // evacuation candidate.
+    host()->GetHeap()->incremental_marking()->RecordWrite(
+        host(), NULL, cell);
+  }
 }
 
 
@@ -120,10 +164,14 @@ Address RelocInfo::call_address() {
 
 
 void RelocInfo::set_call_address(Address target) {
-  ASSERT(IsPatchedReturnSequence());
-  // The 2 instructions offset assumes patched return sequence.
-  ASSERT(IsJSReturn(rmode()));
+  ASSERT((IsJSReturn(rmode()) && IsPatchedReturnSequence()) ||
+         (IsDebugBreakSlot(rmode()) && IsPatchedDebugBreakSlotSequence()));
   Memory::Address_at(pc_ + 2 * Assembler::kInstrSize) = target;
+  if (host() != NULL) {
+    Object* target_code = Code::GetCodeFromTargetAddress(target);
+    host()->GetHeap()->incremental_marking()->RecordWriteIntoCode(
+        host(), this, HeapObject::cast(target_code));
+  }
 }
 
 
@@ -132,16 +180,15 @@ Object* RelocInfo::call_object() {
 }
 
 
-Object** RelocInfo::call_object_address() {
-  ASSERT(IsPatchedReturnSequence());
-  // The 2 instructions offset assumes patched return sequence.
-  ASSERT(IsJSReturn(rmode()));
-  return reinterpret_cast<Object**>(pc_ + 2 * Assembler::kInstrSize);
+void RelocInfo::set_call_object(Object* target) {
+  *call_object_address() = target;
 }
 
 
-void RelocInfo::set_call_object(Object* target) {
-  *call_object_address() = target;
+Object** RelocInfo::call_object_address() {
+  ASSERT((IsJSReturn(rmode()) && IsPatchedReturnSequence()) ||
+         (IsDebugBreakSlot(rmode()) && IsPatchedDebugBreakSlotSequence()));
+  return reinterpret_cast<Object**>(pc_ + 2 * Assembler::kInstrSize);
 }
 
 
@@ -166,28 +213,56 @@ bool RelocInfo::IsPatchedReturnSequence() {
 
 bool RelocInfo::IsPatchedDebugBreakSlotSequence() {
   Instr current_instr = Assembler::instr_at(pc_);
-  return !Assembler::IsNop(current_instr, 2);
+  return !Assembler::IsNop(current_instr, Assembler::DEBUG_BREAK_NOP);
 }
 
 
 void RelocInfo::Visit(ObjectVisitor* visitor) {
   RelocInfo::Mode mode = rmode();
   if (mode == RelocInfo::EMBEDDED_OBJECT) {
-    visitor->VisitPointer(target_object_address());
+    visitor->VisitEmbeddedPointer(this);
   } else if (RelocInfo::IsCodeTarget(mode)) {
     visitor->VisitCodeTarget(this);
+  } else if (mode == RelocInfo::GLOBAL_PROPERTY_CELL) {
+    visitor->VisitGlobalPropertyCell(this);
   } else if (mode == RelocInfo::EXTERNAL_REFERENCE) {
-    visitor->VisitExternalReference(target_reference_address());
+    visitor->VisitExternalReference(this);
 #ifdef ENABLE_DEBUGGER_SUPPORT
-  } else if (Debug::has_break_points() &&
-             ((RelocInfo::IsJSReturn(mode) &&
+  // TODO(isolates): Get a cached isolate below.
+  } else if (((RelocInfo::IsJSReturn(mode) &&
               IsPatchedReturnSequence()) ||
              (RelocInfo::IsDebugBreakSlot(mode) &&
-              IsPatchedDebugBreakSlotSequence()))) {
+              IsPatchedDebugBreakSlotSequence())) &&
+             Isolate::Current()->debug()->has_break_points()) {
     visitor->VisitDebugTarget(this);
 #endif
   } else if (mode == RelocInfo::RUNTIME_ENTRY) {
     visitor->VisitRuntimeEntry(this);
+  }
+}
+
+
+template<typename StaticVisitor>
+void RelocInfo::Visit(Heap* heap) {
+  RelocInfo::Mode mode = rmode();
+  if (mode == RelocInfo::EMBEDDED_OBJECT) {
+    StaticVisitor::VisitEmbeddedPointer(heap, this);
+  } else if (RelocInfo::IsCodeTarget(mode)) {
+    StaticVisitor::VisitCodeTarget(heap, this);
+  } else if (mode == RelocInfo::GLOBAL_PROPERTY_CELL) {
+    StaticVisitor::VisitGlobalPropertyCell(heap, this);
+  } else if (mode == RelocInfo::EXTERNAL_REFERENCE) {
+    StaticVisitor::VisitExternalReference(this);
+#ifdef ENABLE_DEBUGGER_SUPPORT
+  } else if (heap->isolate()->debug()->has_break_points() &&
+             ((RelocInfo::IsJSReturn(mode) &&
+              IsPatchedReturnSequence()) ||
+             (RelocInfo::IsDebugBreakSlot(mode) &&
+              IsPatchedDebugBreakSlotSequence()))) {
+    StaticVisitor::VisitDebugTarget(heap, this);
+#endif
+  } else if (mode == RelocInfo::RUNTIME_ENTRY) {
+    StaticVisitor::VisitRuntimeEntry(this);
   }
 }
 
@@ -267,9 +342,7 @@ Address Assembler::target_address_address_at(Address pc) {
   }
 #endif
 
-  // Verify that the instruction to patch is a
-  // ldr<cond> <Rd>, [pc +/- offset_12].
-  ASSERT((instr & 0x0f7f0000) == 0x051f0000);
+  ASSERT(IsLdrPcImmediateOffset(instr));
   int offset = instr & 0xfff;  // offset_12 is unsigned
   if ((instr & (1 << 23)) == 0) offset = -offset;  // U bit defines offset sign
   // Verify that the constant pool comes after the instruction referencing it.

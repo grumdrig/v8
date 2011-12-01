@@ -1,4 +1,4 @@
-// Copyright 2006-2009 the V8 project authors. All rights reserved.
+// Copyright 2011 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -29,6 +29,8 @@
 #define V8_IA32_MACRO_ASSEMBLER_IA32_H_
 
 #include "assembler.h"
+#include "frames.h"
+#include "v8globals.h"
 
 namespace v8 {
 namespace internal {
@@ -44,129 +46,252 @@ enum AllocationFlags {
   RESULT_CONTAINS_TOP = 1 << 1
 };
 
+
 // Convenience for platform-independent signatures.  We do not normally
 // distinguish memory operands from other operands on ia32.
 typedef Operand MemOperand;
 
-// Forward declaration.
-class JumpTarget;
+enum RememberedSetAction { EMIT_REMEMBERED_SET, OMIT_REMEMBERED_SET };
+enum SmiCheck { INLINE_SMI_CHECK, OMIT_SMI_CHECK };
+
+
+bool AreAliased(Register r1, Register r2, Register r3, Register r4);
+
 
 // MacroAssembler implements a collection of frequently used macros.
 class MacroAssembler: public Assembler {
  public:
-  MacroAssembler(void* buffer, int size);
+  // The isolate parameter can be NULL if the macro assembler should
+  // not use isolate-dependent functionality. In this case, it's the
+  // responsibility of the caller to never invoke such function on the
+  // macro assembler.
+  MacroAssembler(Isolate* isolate, void* buffer, int size);
 
   // ---------------------------------------------------------------------------
   // GC Support
+  enum RememberedSetFinalAction {
+    kReturnAtEnd,
+    kFallThroughAtEnd
+  };
 
-  // For page containing |object| mark region covering |addr| dirty.
-  // RecordWriteHelper only works if the object is not in new
-  // space.
-  void RecordWriteHelper(Register object,
-                         Register addr,
-                         Register scratch);
+  // Record in the remembered set the fact that we have a pointer to new space
+  // at the address pointed to by the addr register.  Only works if addr is not
+  // in new space.
+  void RememberedSetHelper(Register object,  // Used for debug code.
+                           Register addr,
+                           Register scratch,
+                           SaveFPRegsMode save_fp,
+                           RememberedSetFinalAction and_then);
 
-  // Check if object is in new space.
-  // scratch can be object itself, but it will be clobbered.
-  void InNewSpace(Register object,
-                  Register scratch,
-                  Condition cc,  // equal for new space, not_equal otherwise.
-                  Label* branch);
+  void CheckPageFlag(Register object,
+                     Register scratch,
+                     int mask,
+                     Condition cc,
+                     Label* condition_met,
+                     Label::Distance condition_met_distance = Label::kFar);
 
-  // For page containing |object| mark region covering [object+offset]
-  // dirty. |object| is the object being stored into, |value| is the
-  // object being stored. If offset is zero, then the scratch register
-  // contains the array index into the elements array represented as a
-  // Smi. All registers are clobbered by the operation. RecordWrite
+  // Check if object is in new space.  Jumps if the object is not in new space.
+  // The register scratch can be object itself, but scratch will be clobbered.
+  void JumpIfNotInNewSpace(Register object,
+                           Register scratch,
+                           Label* branch,
+                           Label::Distance distance = Label::kFar) {
+    InNewSpace(object, scratch, zero, branch, distance);
+  }
+
+  // Check if object is in new space.  Jumps if the object is in new space.
+  // The register scratch can be object itself, but it will be clobbered.
+  void JumpIfInNewSpace(Register object,
+                        Register scratch,
+                        Label* branch,
+                        Label::Distance distance = Label::kFar) {
+    InNewSpace(object, scratch, not_zero, branch, distance);
+  }
+
+  // Check if an object has a given incremental marking color.  Also uses ecx!
+  void HasColor(Register object,
+                Register scratch0,
+                Register scratch1,
+                Label* has_color,
+                Label::Distance has_color_distance,
+                int first_bit,
+                int second_bit);
+
+  void JumpIfBlack(Register object,
+                   Register scratch0,
+                   Register scratch1,
+                   Label* on_black,
+                   Label::Distance on_black_distance = Label::kFar);
+
+  // Checks the color of an object.  If the object is already grey or black
+  // then we just fall through, since it is already live.  If it is white and
+  // we can determine that it doesn't need to be scanned, then we just mark it
+  // black and fall through.  For the rest we jump to the label so the
+  // incremental marker can fix its assumptions.
+  void EnsureNotWhite(Register object,
+                      Register scratch1,
+                      Register scratch2,
+                      Label* object_is_white_and_not_data,
+                      Label::Distance distance);
+
+  // Notify the garbage collector that we wrote a pointer into an object.
+  // |object| is the object being stored into, |value| is the object being
+  // stored.  value and scratch registers are clobbered by the operation.
+  // The offset is the offset from the start of the object, not the offset from
+  // the tagged HeapObject pointer.  For use with FieldOperand(reg, off).
+  void RecordWriteField(
+      Register object,
+      int offset,
+      Register value,
+      Register scratch,
+      SaveFPRegsMode save_fp,
+      RememberedSetAction remembered_set_action = EMIT_REMEMBERED_SET,
+      SmiCheck smi_check = INLINE_SMI_CHECK);
+
+  // As above, but the offset has the tag presubtracted.  For use with
+  // Operand(reg, off).
+  void RecordWriteContextSlot(
+      Register context,
+      int offset,
+      Register value,
+      Register scratch,
+      SaveFPRegsMode save_fp,
+      RememberedSetAction remembered_set_action = EMIT_REMEMBERED_SET,
+      SmiCheck smi_check = INLINE_SMI_CHECK) {
+    RecordWriteField(context,
+                     offset + kHeapObjectTag,
+                     value,
+                     scratch,
+                     save_fp,
+                     remembered_set_action,
+                     smi_check);
+  }
+
+  // Notify the garbage collector that we wrote a pointer into a fixed array.
+  // |array| is the array being stored into, |value| is the
+  // object being stored.  |index| is the array index represented as a
+  // Smi. All registers are clobbered by the operation RecordWriteArray
   // filters out smis so it does not update the write barrier if the
   // value is a smi.
-  void RecordWrite(Register object,
-                   int offset,
-                   Register value,
-                   Register scratch);
+  void RecordWriteArray(
+      Register array,
+      Register value,
+      Register index,
+      SaveFPRegsMode save_fp,
+      RememberedSetAction remembered_set_action = EMIT_REMEMBERED_SET,
+      SmiCheck smi_check = INLINE_SMI_CHECK);
 
   // For page containing |object| mark region covering |address|
   // dirty. |object| is the object being stored into, |value| is the
-  // object being stored. All registers are clobbered by the
+  // object being stored. The address and value registers are clobbered by the
   // operation. RecordWrite filters out smis so it does not update the
   // write barrier if the value is a smi.
-  void RecordWrite(Register object,
-                   Register address,
-                   Register value);
+  void RecordWrite(
+      Register object,
+      Register address,
+      Register value,
+      SaveFPRegsMode save_fp,
+      RememberedSetAction remembered_set_action = EMIT_REMEMBERED_SET,
+      SmiCheck smi_check = INLINE_SMI_CHECK);
 
 #ifdef ENABLE_DEBUGGER_SUPPORT
   // ---------------------------------------------------------------------------
   // Debugger Support
 
-  void SaveRegistersToMemory(RegList regs);
-  void RestoreRegistersFromMemory(RegList regs);
-  void PushRegistersFromMemory(RegList regs);
-  void PopRegistersToMemory(RegList regs);
-  void CopyRegistersFromStackToMemory(Register base,
-                                      Register scratch,
-                                      RegList regs);
   void DebugBreak();
 #endif
 
-  // ---------------------------------------------------------------------------
-  // Stack limit support
+  // Enter specific kind of exit frame. Expects the number of
+  // arguments in register eax and sets up the number of arguments in
+  // register edi and the pointer to the first argument in register
+  // esi.
+  void EnterExitFrame(bool save_doubles);
 
-  // Do simple test for stack overflow. This doesn't handle an overflow.
-  void StackLimitCheck(Label* on_stack_limit_hit);
-
-  // ---------------------------------------------------------------------------
-  // Activation frames
-
-  void EnterInternalFrame() { EnterFrame(StackFrame::INTERNAL); }
-  void LeaveInternalFrame() { LeaveFrame(StackFrame::INTERNAL); }
-
-  void EnterConstructFrame() { EnterFrame(StackFrame::CONSTRUCT); }
-  void LeaveConstructFrame() { LeaveFrame(StackFrame::CONSTRUCT); }
-
-  // Enter specific kind of exit frame; either in normal or debug mode.
-  // Expects the number of arguments in register eax and
-  // sets up the number of arguments in register edi and the pointer
-  // to the first argument in register esi.
-  void EnterExitFrame(ExitFrame::Mode mode);
-
-  void EnterApiExitFrame(ExitFrame::Mode mode, int stack_space, int argc);
+  void EnterApiExitFrame(int argc);
 
   // Leave the current exit frame. Expects the return value in
   // register eax:edx (untouched) and the pointer to the first
   // argument in register esi.
-  void LeaveExitFrame(ExitFrame::Mode mode);
+  void LeaveExitFrame(bool save_doubles);
+
+  // Leave the current exit frame. Expects the return value in
+  // register eax (untouched).
+  void LeaveApiExitFrame();
 
   // Find the function context up the context chain.
   void LoadContext(Register dst, int context_chain_length);
 
+  // Load the global function with the given index.
+  void LoadGlobalFunction(int index, Register function);
+
+  // Load the initial map from the global function. The registers
+  // function and map can be the same.
+  void LoadGlobalFunctionInitialMap(Register function, Register map);
+
+  // Push and pop the registers that can hold pointers.
+  void PushSafepointRegisters() { pushad(); }
+  void PopSafepointRegisters() { popad(); }
+  // Store the value in register/immediate src in the safepoint
+  // register stack slot for register dst.
+  void StoreToSafepointRegisterSlot(Register dst, Register src);
+  void StoreToSafepointRegisterSlot(Register dst, Immediate src);
+  void LoadFromSafepointRegisterSlot(Register dst, Register src);
+
   // ---------------------------------------------------------------------------
   // JavaScript invokes
 
+  // Setup call kind marking in ecx. The method takes ecx as an
+  // explicit first parameter to make the code more readable at the
+  // call sites.
+  void SetCallKind(Register dst, CallKind kind);
+
   // Invoke the JavaScript function code by either calling or jumping.
+  void InvokeCode(Register code,
+                  const ParameterCount& expected,
+                  const ParameterCount& actual,
+                  InvokeFlag flag,
+                  const CallWrapper& call_wrapper,
+                  CallKind call_kind) {
+    InvokeCode(Operand(code), expected, actual, flag, call_wrapper, call_kind);
+  }
+
   void InvokeCode(const Operand& code,
                   const ParameterCount& expected,
                   const ParameterCount& actual,
-                  InvokeFlag flag);
+                  InvokeFlag flag,
+                  const CallWrapper& call_wrapper,
+                  CallKind call_kind);
 
   void InvokeCode(Handle<Code> code,
                   const ParameterCount& expected,
                   const ParameterCount& actual,
                   RelocInfo::Mode rmode,
-                  InvokeFlag flag);
+                  InvokeFlag flag,
+                  const CallWrapper& call_wrapper,
+                  CallKind call_kind);
 
   // Invoke the JavaScript function in the given register. Changes the
   // current context to the context in the function before invoking.
   void InvokeFunction(Register function,
                       const ParameterCount& actual,
-                      InvokeFlag flag);
+                      InvokeFlag flag,
+                      const CallWrapper& call_wrapper,
+                      CallKind call_kind);
 
-  void InvokeFunction(JSFunction* function,
+  void InvokeFunction(Handle<JSFunction> function,
                       const ParameterCount& actual,
-                      InvokeFlag flag);
+                      InvokeFlag flag,
+                      const CallWrapper& call_wrapper,
+                      CallKind call_kind);
 
   // Invoke specified builtin JavaScript function. Adds an entry to
   // the unresolved list if the name does not resolve.
-  void InvokeBuiltin(Builtins::JavaScript id, InvokeFlag flag);
+  void InvokeBuiltin(Builtins::JavaScript id,
+                     InvokeFlag flag,
+                     const CallWrapper& call_wrapper = NullCallWrapper());
+
+  // Store the function for the given builtin in the target register.
+  void GetBuiltinFunction(Register target, Builtins::JavaScript id);
 
   // Store the code object for the given builtin in the target register.
   void GetBuiltinEntry(Register target, Builtins::JavaScript id);
@@ -175,6 +300,14 @@ class MacroAssembler: public Assembler {
   void Set(Register dst, const Immediate& x);
   void Set(const Operand& dst, const Immediate& x);
 
+  // Support for constant splitting.
+  bool IsUnsafeImmediate(const Immediate& x);
+  void SafeSet(Register dst, const Immediate& x);
+  void SafePush(const Immediate& x);
+
+  // Compare a register against a known root, e.g. undefined, null, true, ...
+  void CompareRoot(Register with, Heap::RootListIndex index);
+
   // Compare object type for heap object.
   // Incoming register is heap_object and outgoing register is map.
   void CmpObjectType(Register heap_object, InstanceType type, Register map);
@@ -182,13 +315,50 @@ class MacroAssembler: public Assembler {
   // Compare instance type for map.
   void CmpInstanceType(Register map, InstanceType type);
 
-  // Check if the map of an object is equal to a specified map and
-  // branch to label if not. Skip the smi check if not required
-  // (object is known to be a heap object)
+  // Check if a map for a JSObject indicates that the object has fast elements.
+  // Jump to the specified label if it does not.
+  void CheckFastElements(Register map,
+                         Label* fail,
+                         Label::Distance distance = Label::kFar);
+
+  // Check if a map for a JSObject indicates that the object can have both smi
+  // and HeapObject elements.  Jump to the specified label if it does not.
+  void CheckFastObjectElements(Register map,
+                               Label* fail,
+                               Label::Distance distance = Label::kFar);
+
+  // Check if a map for a JSObject indicates that the object has fast smi only
+  // elements.  Jump to the specified label if it does not.
+  void CheckFastSmiOnlyElements(Register map,
+                                Label* fail,
+                                Label::Distance distance = Label::kFar);
+
+  // Check to see if maybe_number can be stored as a double in
+  // FastDoubleElements. If it can, store it at the index specified by key in
+  // the FastDoubleElements array elements, otherwise jump to fail.
+  void StoreNumberToDoubleElements(Register maybe_number,
+                                   Register elements,
+                                   Register key,
+                                   Register scratch1,
+                                   XMMRegister scratch2,
+                                   Label* fail,
+                                   bool specialize_for_processor);
+
+  // Check if the map of an object is equal to a specified map and branch to
+  // label if not. Skip the smi check if not required (object is known to be a
+  // heap object)
   void CheckMap(Register obj,
                 Handle<Map> map,
                 Label* fail,
-                bool is_heap_object);
+                SmiCheckType smi_check_type);
+
+  // Check if the map of an object is equal to a specified map and branch to a
+  // specified target if equal. Skip the smi check if not required (object is
+  // known to be a heap object)
+  void DispatchMap(Register obj,
+                   Handle<Map> map,
+                   Handle<Code> success,
+                   SmiCheckType smi_check_type);
 
   // Check if the object in register heap_object is a string. Afterwards the
   // register map contains the object map and the register instance_type
@@ -215,15 +385,56 @@ class MacroAssembler: public Assembler {
   // jcc instructions (je, ja, jae, jb, jbe, je, and jz).
   void FCmp();
 
+  void ClampUint8(Register reg);
+
+  void ClampDoubleToUint8(XMMRegister input_reg,
+                          XMMRegister scratch_reg,
+                          Register result_reg);
+
+
   // Smi tagging support.
   void SmiTag(Register reg) {
-    ASSERT(kSmiTag == 0);
-    ASSERT(kSmiTagSize == 1);
-    add(reg, Operand(reg));
+    STATIC_ASSERT(kSmiTag == 0);
+    STATIC_ASSERT(kSmiTagSize == 1);
+    add(reg, reg);
   }
   void SmiUntag(Register reg) {
     sar(reg, kSmiTagSize);
   }
+
+  // Modifies the register even if it does not contain a Smi!
+  void SmiUntag(Register reg, Label* is_smi) {
+    STATIC_ASSERT(kSmiTagSize == 1);
+    sar(reg, kSmiTagSize);
+    STATIC_ASSERT(kSmiTag == 0);
+    j(not_carry, is_smi);
+  }
+
+  // Jump the register contains a smi.
+  inline void JumpIfSmi(Register value,
+                        Label* smi_label,
+                        Label::Distance distance = Label::kFar) {
+    test(value, Immediate(kSmiTagMask));
+    j(zero, smi_label, distance);
+  }
+  // Jump if the operand is a smi.
+  inline void JumpIfSmi(Operand value,
+                        Label* smi_label,
+                        Label::Distance distance = Label::kFar) {
+    test(value, Immediate(kSmiTagMask));
+    j(zero, smi_label, distance);
+  }
+  // Jump if register contain a non-smi.
+  inline void JumpIfNotSmi(Register value,
+                           Label* not_smi_label,
+                           Label::Distance distance = Label::kFar) {
+    test(value, Immediate(kSmiTagMask));
+    j(not_zero, not_smi_label, distance);
+  }
+
+  void LoadInstanceDescriptors(Register map, Register descriptors);
+
+  void LoadPowerOf2(XMMRegister dst, Register scratch, int power);
 
   // Abort execution if argument is not a number. Used in debug code.
   void AbortIfNotNumber(Register object);
@@ -231,15 +442,27 @@ class MacroAssembler: public Assembler {
   // Abort execution if argument is not a smi. Used in debug code.
   void AbortIfNotSmi(Register object);
 
+  // Abort execution if argument is a smi. Used in debug code.
+  void AbortIfSmi(Register object);
+
+  // Abort execution if argument is a string. Used in debug code.
+  void AbortIfNotString(Register object);
+
   // ---------------------------------------------------------------------------
   // Exception handling
 
-  // Push a new try handler and link into try handler chain.  The return
-  // address must be pushed before calling this helper.
-  void PushTryHandler(CodeLocation try_location, HandlerType type);
+  // Push a new try handler and link it into try handler chain.
+  void PushTryHandler(CodeLocation try_location,
+                      HandlerType type,
+                      int handler_index);
 
   // Unlink the stack handler on top of the stack from the try handler chain.
   void PopTryHandler();
+
+  // Activate the top handler in the try hander chain.
+  void Throw(Register value);
+
+  void ThrowUncatchable(UncatchableExceptionType type, Register value);
 
   // ---------------------------------------------------------------------------
   // Inline caching support
@@ -250,6 +473,15 @@ class MacroAssembler: public Assembler {
   void CheckAccessGlobalProxy(Register holder_reg,
                               Register scratch,
                               Label* miss);
+
+
+  void LoadFromNumberDictionary(Label* miss,
+                                Register elements,
+                                Register key,
+                                Register r0,
+                                Register r1,
+                                Register r2,
+                                Register result);
 
 
   // ---------------------------------------------------------------------------
@@ -317,10 +549,15 @@ class MacroAssembler: public Assembler {
                            Register scratch2,
                            Register scratch3,
                            Label* gc_required);
+  void AllocateAsciiString(Register result,
+                           int length,
+                           Register scratch1,
+                           Register scratch2,
+                           Label* gc_required);
 
   // Allocate a raw cons string object. Only the map field of the result is
   // initialized.
-  void AllocateConsString(Register result,
+  void AllocateTwoByteConsString(Register result,
                           Register scratch1,
                           Register scratch2,
                           Label* gc_required);
@@ -329,17 +566,40 @@ class MacroAssembler: public Assembler {
                                Register scratch2,
                                Label* gc_required);
 
+  // Allocate a raw sliced string object. Only the map field of the result is
+  // initialized.
+  void AllocateTwoByteSlicedString(Register result,
+                            Register scratch1,
+                            Register scratch2,
+                            Label* gc_required);
+  void AllocateAsciiSlicedString(Register result,
+                                 Register scratch1,
+                                 Register scratch2,
+                                 Label* gc_required);
+
+  // Copy memory, byte-by-byte, from source to destination.  Not optimized for
+  // long or aligned copies.
+  // The contents of index and scratch are destroyed.
+  void CopyBytes(Register source,
+                 Register destination,
+                 Register length,
+                 Register scratch);
+
+  // Initialize fields with filler values.  Fields starting at |start_offset|
+  // not including end_offset are overwritten with the value in |filler|.  At
+  // the end the loop, |start_offset| takes the value of |end_offset|.
+  void InitializeFieldsWithFiller(Register start_offset,
+                                  Register end_offset,
+                                  Register filler);
+
   // ---------------------------------------------------------------------------
   // Support functions.
 
+  // Check a boolean-bit of a Smi field.
+  void BooleanBitTest(Register object, int field_offset, int bit_index);
+
   // Check if result is zero and op is negative.
   void NegativeZeroTest(Register result, Register op, Label* then_label);
-
-  // Check if result is zero and op is negative in code using jump targets.
-  void NegativeZeroTest(CodeGenerator* cgen,
-                        Register result,
-                        Register op,
-                        JumpTarget* then_target);
 
   // Check if result is zero and any of op1 and op2 are negative.
   // Register scratch is destroyed, and it must be different from op2.
@@ -354,50 +614,40 @@ class MacroAssembler: public Assembler {
   void TryGetFunctionPrototype(Register function,
                                Register result,
                                Register scratch,
-                               Label* miss);
+                               Label* miss,
+                               bool miss_on_bound_function = false);
 
   // Generates code for reporting that an illegal operation has
   // occurred.
   void IllegalOperation(int num_arguments);
 
+  // Picks out an array index from the hash field.
+  // Register use:
+  //   hash - holds the index's hash. Clobbered.
+  //   index - holds the overwritten index on exit.
+  void IndexFromHash(Register hash, Register index);
+
   // ---------------------------------------------------------------------------
   // Runtime calls
 
   // Call a code stub.  Generate the code if necessary.
-  void CallStub(CodeStub* stub);
-
-  // Call a code stub and return the code object called.  Try to generate
-  // the code if necessary.  Do not perform a GC but instead return a retry
-  // after GC failure.
-  Object* TryCallStub(CodeStub* stub);
+  void CallStub(CodeStub* stub, unsigned ast_id = kNoASTId);
 
   // Tail call a code stub (jump).  Generate the code if necessary.
   void TailCallStub(CodeStub* stub);
-
-  // Tail call a code stub (jump) and return the code object called.  Try to
-  // generate the code if necessary.  Do not perform a GC but instead return
-  // a retry after GC failure.
-  Object* TryTailCallStub(CodeStub* stub);
 
   // Return from a code stub after popping its arguments.
   void StubReturn(int argc);
 
   // Call a runtime routine.
-  void CallRuntime(Runtime::Function* f, int num_arguments);
-
-  // Call a runtime function, returning the CodeStub object called.
-  // Try to generate the stub code if necessary.  Do not perform a GC
-  // but instead return a retry after GC failure.
-  Object* TryCallRuntime(Runtime::Function* f, int num_arguments);
+  void CallRuntime(const Runtime::Function* f, int num_arguments);
+  void CallRuntimeSaveDoubles(Runtime::FunctionId id);
 
   // Convenience function: Same as above, but takes the fid instead.
   void CallRuntime(Runtime::FunctionId id, int num_arguments);
 
   // Convenience function: call an external reference.
   void CallExternalReference(ExternalReference ref, int num_arguments);
-
-  // Convenience function: Same as above, but takes the fid instead.
-  Object* TryCallRuntime(Runtime::FunctionId id, int num_arguments);
 
   // Tail call of a runtime routine (jump).
   // Like JumpToExternalReference, but also takes care of passing the number
@@ -428,24 +678,30 @@ class MacroAssembler: public Assembler {
   void CallCFunction(ExternalReference function, int num_arguments);
   void CallCFunction(Register function, int num_arguments);
 
-  void PushHandleScope(Register scratch);
+  // Prepares stack to put arguments (aligns and so on). Reserves
+  // space for return value if needed (assumes the return value is a handle).
+  // Arguments must be stored in ApiParameterOperand(0), ApiParameterOperand(1)
+  // etc. Saves context (esi). If space was reserved for return value then
+  // stores the pointer to the reserved slot into esi.
+  void PrepareCallApiFunction(int argc);
 
-  // Pops a handle scope using the specified scratch register and
-  // ensuring that saved register, it is not no_reg, is left unchanged.
-  void PopHandleScope(Register saved, Register scratch);
-
-  // As PopHandleScope, but does not perform a GC.  Instead, returns a
-  // retry after GC failure object if GC is necessary.
-  Object* TryPopHandleScope(Register saved, Register scratch);
+  // Calls an API function.  Allocates HandleScope, extracts returned value
+  // from handle and propagates exceptions.  Clobbers ebx, edi and
+  // caller-save registers.  Restores context.  On return removes
+  // stack_space * kPointerSize (GCed).
+  void CallApiFunctionAndReturn(Address function_address, int stack_space);
 
   // Jump to a runtime routine.
   void JumpToExternalReference(const ExternalReference& ext);
-
 
   // ---------------------------------------------------------------------------
   // Utilities
 
   void Ret();
+
+  // Return and drop arguments from stack, where the number of arguments
+  // may be bigger than 2^16 - 1.  Requires a scratch register.
+  void Ret(int bytes_dropped, Register scratch);
 
   // Emit code to discard a non-negative number of pointer-sized elements
   // from the stack, clobbering only the esp register.
@@ -453,9 +709,24 @@ class MacroAssembler: public Assembler {
 
   void Call(Label* target) { call(target); }
 
+  // Emit call to the code we are currently generating.
+  void CallSelf() {
+    Handle<Code> self(reinterpret_cast<Code**>(CodeObject().location()));
+    call(self, RelocInfo::CODE_TARGET);
+  }
+
+  // Move if the registers are not identical.
+  void Move(Register target, Register source);
+
   void Move(Register target, Handle<Object> value);
 
-  Handle<Object> CodeObject() { return code_object_; }
+  // Push a handle value.
+  void Push(Handle<Object> handle) { push(handle); }
+
+  Handle<Object> CodeObject() {
+    ASSERT(!code_object_.is_null());
+    return code_object_;
+  }
 
 
   // ---------------------------------------------------------------------------
@@ -475,6 +746,8 @@ class MacroAssembler: public Assembler {
   // Use --debug_code to enable.
   void Assert(Condition cc, const char* msg);
 
+  void AssertFastElements(Register elements);
+
   // Like Assert(), but always enabled.
   void Check(Condition cc, const char* msg);
 
@@ -489,6 +762,9 @@ class MacroAssembler: public Assembler {
   bool generating_stub() { return generating_stub_; }
   void set_allow_stub_calls(bool value) { allow_stub_calls_ = value; }
   bool allow_stub_calls() { return allow_stub_calls_; }
+  void set_has_frame(bool value) { has_frame_ = value; }
+  bool has_frame() { return has_frame_; }
+  inline bool AllowThisStubCall(CodeStub* stub);
 
   // ---------------------------------------------------------------------------
   // String utilities.
@@ -508,9 +784,18 @@ class MacroAssembler: public Assembler {
                                            Register scratch2,
                                            Label* on_not_flat_ascii_strings);
 
+  static int SafepointRegisterStackIndex(Register reg) {
+    return SafepointRegisterStackIndex(reg.code());
+  }
+
+  // Activation support.
+  void EnterFrame(StackFrame::Type type);
+  void LeaveFrame(StackFrame::Type type);
+
  private:
   bool generating_stub_;
   bool allow_stub_calls_;
+  bool has_frame_;
   // This handle will be patched with the code object on installation.
   Handle<Object> code_object_;
 
@@ -520,18 +805,18 @@ class MacroAssembler: public Assembler {
                       Handle<Code> code_constant,
                       const Operand& code_operand,
                       Label* done,
-                      InvokeFlag flag);
+                      InvokeFlag flag,
+                      Label::Distance done_distance,
+                      const CallWrapper& call_wrapper = NullCallWrapper(),
+                      CallKind call_kind = CALL_AS_METHOD);
 
-  // Activation support.
-  void EnterFrame(StackFrame::Type type);
-  void LeaveFrame(StackFrame::Type type);
+  void EnterExitFramePrologue();
+  void EnterExitFrameEpilogue(int argc, bool save_doubles);
 
-  void EnterExitFramePrologue(ExitFrame::Mode mode);
-  void EnterExitFrameEpilogue(ExitFrame::Mode mode, int argc);
+  void LeaveExitFrameEpilogue();
 
   // Allocation support helpers.
   void LoadAllocationTopHelper(Register result,
-                               Register result_end,
                                Register scratch,
                                AllocationFlags flags);
   void UpdateAllocationTopHelper(Register result_end, Register scratch);
@@ -539,9 +824,36 @@ class MacroAssembler: public Assembler {
   // Helper for PopHandleScope.  Allowed to perform a GC and returns
   // NULL if gc_allowed.  Does not perform a GC if !gc_allowed, and
   // possibly returns a failure object indicating an allocation failure.
-  Object* PopHandleScopeHelper(Register saved,
-                               Register scratch,
-                               bool gc_allowed);
+  MUST_USE_RESULT MaybeObject* PopHandleScopeHelper(Register saved,
+                                                    Register scratch,
+                                                    bool gc_allowed);
+
+  // Helper for implementing JumpIfNotInNewSpace and JumpIfInNewSpace.
+  void InNewSpace(Register object,
+                  Register scratch,
+                  Condition cc,
+                  Label* condition_met,
+                  Label::Distance condition_met_distance = Label::kFar);
+
+  // Helper for finding the mark bits for an address.  Afterwards, the
+  // bitmap register points at the word with the mark bits and the mask
+  // the position of the first bit.  Uses ecx as scratch and leaves addr_reg
+  // unchanged.
+  inline void GetMarkBits(Register addr_reg,
+                          Register bitmap_reg,
+                          Register mask_reg);
+
+  // Helper for throwing exceptions.  Compute a handler address and jump to
+  // it.  See the implementation for register usage.
+  void JumpToHandlerEntry();
+
+  // Compute memory operands for safepoint stack slots.
+  Operand SafepointRegisterSlot(Register reg);
+  static int SafepointRegisterStackIndex(int reg_code);
+
+  // Needs access to SafepointRegisterStackIndex for optimized frame
+  // traversal.
+  friend class OptimizedFrame;
 };
 
 
@@ -569,18 +881,32 @@ class CodePatcher {
 // Static helper functions.
 
 // Generate an Operand for loading a field from an object.
-static inline Operand FieldOperand(Register object, int offset) {
+inline Operand FieldOperand(Register object, int offset) {
   return Operand(object, offset - kHeapObjectTag);
 }
 
 
 // Generate an Operand for loading an indexed field from an object.
-static inline Operand FieldOperand(Register object,
-                                   Register index,
-                                   ScaleFactor scale,
-                                   int offset) {
+inline Operand FieldOperand(Register object,
+                            Register index,
+                            ScaleFactor scale,
+                            int offset) {
   return Operand(object, index, scale, offset - kHeapObjectTag);
 }
+
+
+inline Operand ContextOperand(Register context, int index) {
+  return Operand(context, Context::SlotOffset(index));
+}
+
+
+inline Operand GlobalObjectOperand() {
+  return ContextOperand(esi, Context::GLOBAL_INDEX);
+}
+
+
+// Generates an Operand for saving parameters after PrepareCallApiFunction.
+Operand ApiParameterOperand(int index);
 
 
 #ifdef GENERATED_CODE_COVERAGE

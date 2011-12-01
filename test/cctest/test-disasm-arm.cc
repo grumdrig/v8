@@ -1,4 +1,4 @@
-// Copyright 2007-2008 the V8 project authors. All rights reserved.
+// Copyright 2011 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -72,11 +72,11 @@ bool DisassembleAndCompare(byte* pc, const char* compare_string) {
 // Setup V8 to a state where we can at least run the assembler and
 // disassembler. Declare the variables and allocate the data structures used
 // in the rest of the macros.
-#define SETUP() \
-  InitializeVM(); \
-  v8::HandleScope scope; \
+#define SETUP()                                           \
+  InitializeVM();                                         \
+  v8::HandleScope scope;                                  \
   byte *buffer = reinterpret_cast<byte*>(malloc(4*1024)); \
-  Assembler assm(buffer, 4*1024); \
+  Assembler assm(Isolate::Current(), buffer, 4*1024);     \
   bool failure = false;
 
 
@@ -87,9 +87,9 @@ bool DisassembleAndCompare(byte* pc, const char* compare_string) {
 #define COMPARE(asm_, compare_string) \
   { \
     int pc_offset = assm.pc_offset(); \
-    byte *pc = &buffer[pc_offset]; \
+    byte *progcounter = &buffer[pc_offset]; \
     assm.asm_; \
-    if (!DisassembleAndCompare(pc, compare_string)) failure = true; \
+    if (!DisassembleAndCompare(progcounter, compare_string)) failure = true; \
   }
 
 
@@ -396,6 +396,15 @@ TEST(Type3) {
             "e7df0f91       bfi r0, r1, #31, #1");
     COMPARE(bfi(r1, r0, 31, 1),
             "e7df1f90       bfi r1, r0, #31, #1");
+
+    COMPARE(usat(r0, 1, Operand(r1)),
+            "e6e10011       usat r0, #1, r1");
+    COMPARE(usat(r2, 7, Operand(lr)),
+            "e6e7201e       usat r2, #7, lr");
+    COMPARE(usat(r3, 31, Operand(r4, LSL, 31)),
+            "e6ff3f94       usat r3, #31, r4, lsl #31");
+    COMPARE(usat(r8, 0, Operand(r5, ASR, 17)),
+            "e6e088d5       usat r8, #0, r5, asr #17");
   }
 
   VERIFY_RUN();
@@ -412,6 +421,29 @@ TEST(Vfp) {
             "eeb00b41       vmov.f64 d0, d1");
     COMPARE(vmov(d3, d3, eq),
             "0eb03b43       vmov.f64eq d3, d3");
+
+    COMPARE(vmov(s0, s31),
+            "eeb00a6f       vmov.f32 s0, s31");
+    COMPARE(vmov(s31, s0),
+            "eef0fa40       vmov.f32 s31, s0");
+    COMPARE(vmov(r0, s0),
+            "ee100a10       vmov r0, s0");
+    COMPARE(vmov(r10, s31),
+            "ee1faa90       vmov r10, s31");
+    COMPARE(vmov(s0, r0),
+            "ee000a10       vmov s0, r0");
+    COMPARE(vmov(s31, r10),
+            "ee0faa90       vmov s31, r10");
+
+    COMPARE(vabs(d0, d1),
+            "eeb00bc1       vabs.f64 d0, d1");
+    COMPARE(vabs(d3, d4, mi),
+            "4eb03bc4       vabs.f64mi d3, d4");
+
+    COMPARE(vneg(d0, d1),
+            "eeb10b41       vneg.f64 d0, d1");
+    COMPARE(vneg(d3, d4, mi),
+            "4eb13b44       vneg.f64mi d3, d4");
 
     COMPARE(vadd(d0, d1, d2),
             "ee310b02       vadd.f64 d0, d1, d2");
@@ -442,7 +474,275 @@ TEST(Vfp) {
             "eeb70b00       vmov.f64 d0, #1");
     COMPARE(vmov(d2, -13.0),
             "eeba2b0a       vmov.f64 d2, #-13");
+
+    COMPARE(vldr(s0, r0, 0),
+            "ed900a00       vldr s0, [r0 + 4*0]");
+    COMPARE(vldr(s1, r1, 4),
+            "edd10a01       vldr s1, [r1 + 4*1]");
+    COMPARE(vldr(s15, r4, 16),
+            "edd47a04       vldr s15, [r4 + 4*4]");
+    COMPARE(vldr(s16, r5, 20),
+            "ed958a05       vldr s16, [r5 + 4*5]");
+    COMPARE(vldr(s31, r10, 1020),
+            "eddafaff       vldr s31, [r10 + 4*255]");
+
+    COMPARE(vstr(s0, r0, 0),
+            "ed800a00       vstr s0, [r0 + 4*0]");
+    COMPARE(vstr(s1, r1, 4),
+            "edc10a01       vstr s1, [r1 + 4*1]");
+    COMPARE(vstr(s15, r8, 8),
+            "edc87a02       vstr s15, [r8 + 4*2]");
+    COMPARE(vstr(s16, r9, 12),
+            "ed898a03       vstr s16, [r9 + 4*3]");
+    COMPARE(vstr(s31, r10, 1020),
+            "edcafaff       vstr s31, [r10 + 4*255]");
+
+    COMPARE(vldr(d0, r0, 0),
+            "ed900b00       vldr d0, [r0 + 4*0]");
+    COMPARE(vldr(d1, r1, 4),
+            "ed911b01       vldr d1, [r1 + 4*1]");
+    COMPARE(vldr(d15, r10, 1020),
+            "ed9afbff       vldr d15, [r10 + 4*255]");
+    COMPARE(vstr(d0, r0, 0),
+            "ed800b00       vstr d0, [r0 + 4*0]");
+    COMPARE(vstr(d1, r1, 4),
+            "ed811b01       vstr d1, [r1 + 4*1]");
+    COMPARE(vstr(d15, r10, 1020),
+            "ed8afbff       vstr d15, [r10 + 4*255]");
+
+    COMPARE(vmsr(r5),
+            "eee15a10       vmsr FPSCR, r5");
+    COMPARE(vmsr(r10, pl),
+            "5ee1aa10       vmsrpl FPSCR, r10");
+    COMPARE(vmsr(pc),
+            "eee1fa10       vmsr FPSCR, APSR");
+    COMPARE(vmrs(r5),
+            "eef15a10       vmrs r5, FPSCR");
+    COMPARE(vmrs(r10, ge),
+            "aef1aa10       vmrsge r10, FPSCR");
+    COMPARE(vmrs(pc),
+            "eef1fa10       vmrs APSR, FPSCR");
+
+    COMPARE(vstm(ia, r0, d1, d3),
+            "ec801b06       vstmia r0, {d1-d3}");
+    COMPARE(vldm(ia, r1, d2, d5),
+            "ec912b08       vldmia r1, {d2-d5}");
+    COMPARE(vstm(ia, r2, d0, d15),
+            "ec820b20       vstmia r2, {d0-d15}");
+    COMPARE(vldm(ia, r3, d0, d15),
+            "ec930b20       vldmia r3, {d0-d15}");
+    COMPARE(vstm(ia, r4, s1, s3),
+            "ecc40a03       vstmia r4, {s1-s3}");
+    COMPARE(vldm(ia, r5, s2, s5),
+            "ec951a04       vldmia r5, {s2-s5}");
+    COMPARE(vstm(ia, r6, s0, s31),
+            "ec860a20       vstmia r6, {s0-s31}");
+    COMPARE(vldm(ia, r7, s0, s31),
+            "ec970a20       vldmia r7, {s0-s31}");
   }
 
   VERIFY_RUN();
 }
+
+
+TEST(LoadStore) {
+  SETUP();
+
+  COMPARE(ldrb(r0, MemOperand(r1)),
+          "e5d10000       ldrb r0, [r1, #+0]");
+  COMPARE(ldrb(r2, MemOperand(r3, 42)),
+          "e5d3202a       ldrb r2, [r3, #+42]");
+  COMPARE(ldrb(r4, MemOperand(r5, -42)),
+          "e555402a       ldrb r4, [r5, #-42]");
+  COMPARE(ldrb(r6, MemOperand(r7, 42, PostIndex)),
+          "e4d7602a       ldrb r6, [r7], #+42");
+  COMPARE(ldrb(r8, MemOperand(r9, -42, PostIndex)),
+          "e459802a       ldrb r8, [r9], #-42");
+  COMPARE(ldrb(r10, MemOperand(fp, 42, PreIndex)),
+          "e5fba02a       ldrb r10, [fp, #+42]!");
+  COMPARE(ldrb(ip, MemOperand(sp, -42, PreIndex)),
+          "e57dc02a       ldrb ip, [sp, #-42]!");
+  COMPARE(ldrb(r0, MemOperand(r1, r2)),
+          "e7d10002       ldrb r0, [r1, +r2]");
+  COMPARE(ldrb(r0, MemOperand(r1, r2, NegOffset)),
+          "e7510002       ldrb r0, [r1, -r2]");
+  COMPARE(ldrb(r0, MemOperand(r1, r2, PostIndex)),
+          "e6d10002       ldrb r0, [r1], +r2");
+  COMPARE(ldrb(r0, MemOperand(r1, r2, NegPostIndex)),
+          "e6510002       ldrb r0, [r1], -r2");
+  COMPARE(ldrb(r0, MemOperand(r1, r2, PreIndex)),
+          "e7f10002       ldrb r0, [r1, +r2]!");
+  COMPARE(ldrb(r0, MemOperand(r1, r2, NegPreIndex)),
+          "e7710002       ldrb r0, [r1, -r2]!");
+
+  COMPARE(strb(r0, MemOperand(r1)),
+          "e5c10000       strb r0, [r1, #+0]");
+  COMPARE(strb(r2, MemOperand(r3, 42)),
+          "e5c3202a       strb r2, [r3, #+42]");
+  COMPARE(strb(r4, MemOperand(r5, -42)),
+          "e545402a       strb r4, [r5, #-42]");
+  COMPARE(strb(r6, MemOperand(r7, 42, PostIndex)),
+          "e4c7602a       strb r6, [r7], #+42");
+  COMPARE(strb(r8, MemOperand(r9, -42, PostIndex)),
+          "e449802a       strb r8, [r9], #-42");
+  COMPARE(strb(r10, MemOperand(fp, 42, PreIndex)),
+          "e5eba02a       strb r10, [fp, #+42]!");
+  COMPARE(strb(ip, MemOperand(sp, -42, PreIndex)),
+          "e56dc02a       strb ip, [sp, #-42]!");
+  COMPARE(strb(r0, MemOperand(r1, r2)),
+          "e7c10002       strb r0, [r1, +r2]");
+  COMPARE(strb(r0, MemOperand(r1, r2, NegOffset)),
+          "e7410002       strb r0, [r1, -r2]");
+  COMPARE(strb(r0, MemOperand(r1, r2, PostIndex)),
+          "e6c10002       strb r0, [r1], +r2");
+  COMPARE(strb(r0, MemOperand(r1, r2, NegPostIndex)),
+          "e6410002       strb r0, [r1], -r2");
+  COMPARE(strb(r0, MemOperand(r1, r2, PreIndex)),
+          "e7e10002       strb r0, [r1, +r2]!");
+  COMPARE(strb(r0, MemOperand(r1, r2, NegPreIndex)),
+          "e7610002       strb r0, [r1, -r2]!");
+
+  COMPARE(ldrh(r0, MemOperand(r1)),
+          "e1d100b0       ldrh r0, [r1, #+0]");
+  COMPARE(ldrh(r2, MemOperand(r3, 42)),
+          "e1d322ba       ldrh r2, [r3, #+42]");
+  COMPARE(ldrh(r4, MemOperand(r5, -42)),
+          "e15542ba       ldrh r4, [r5, #-42]");
+  COMPARE(ldrh(r6, MemOperand(r7, 42, PostIndex)),
+          "e0d762ba       ldrh r6, [r7], #+42");
+  COMPARE(ldrh(r8, MemOperand(r9, -42, PostIndex)),
+          "e05982ba       ldrh r8, [r9], #-42");
+  COMPARE(ldrh(r10, MemOperand(fp, 42, PreIndex)),
+          "e1fba2ba       ldrh r10, [fp, #+42]!");
+  COMPARE(ldrh(ip, MemOperand(sp, -42, PreIndex)),
+          "e17dc2ba       ldrh ip, [sp, #-42]!");
+  COMPARE(ldrh(r0, MemOperand(r1, r2)),
+          "e19100b2       ldrh r0, [r1, +r2]");
+  COMPARE(ldrh(r0, MemOperand(r1, r2, NegOffset)),
+          "e11100b2       ldrh r0, [r1, -r2]");
+  COMPARE(ldrh(r0, MemOperand(r1, r2, PostIndex)),
+          "e09100b2       ldrh r0, [r1], +r2");
+  COMPARE(ldrh(r0, MemOperand(r1, r2, NegPostIndex)),
+          "e01100b2       ldrh r0, [r1], -r2");
+  COMPARE(ldrh(r0, MemOperand(r1, r2, PreIndex)),
+          "e1b100b2       ldrh r0, [r1, +r2]!");
+  COMPARE(ldrh(r0, MemOperand(r1, r2, NegPreIndex)),
+          "e13100b2       ldrh r0, [r1, -r2]!");
+
+  COMPARE(strh(r0, MemOperand(r1)),
+          "e1c100b0       strh r0, [r1, #+0]");
+  COMPARE(strh(r2, MemOperand(r3, 42)),
+          "e1c322ba       strh r2, [r3, #+42]");
+  COMPARE(strh(r4, MemOperand(r5, -42)),
+          "e14542ba       strh r4, [r5, #-42]");
+  COMPARE(strh(r6, MemOperand(r7, 42, PostIndex)),
+          "e0c762ba       strh r6, [r7], #+42");
+  COMPARE(strh(r8, MemOperand(r9, -42, PostIndex)),
+          "e04982ba       strh r8, [r9], #-42");
+  COMPARE(strh(r10, MemOperand(fp, 42, PreIndex)),
+          "e1eba2ba       strh r10, [fp, #+42]!");
+  COMPARE(strh(ip, MemOperand(sp, -42, PreIndex)),
+          "e16dc2ba       strh ip, [sp, #-42]!");
+  COMPARE(strh(r0, MemOperand(r1, r2)),
+          "e18100b2       strh r0, [r1, +r2]");
+  COMPARE(strh(r0, MemOperand(r1, r2, NegOffset)),
+          "e10100b2       strh r0, [r1, -r2]");
+  COMPARE(strh(r0, MemOperand(r1, r2, PostIndex)),
+          "e08100b2       strh r0, [r1], +r2");
+  COMPARE(strh(r0, MemOperand(r1, r2, NegPostIndex)),
+          "e00100b2       strh r0, [r1], -r2");
+  COMPARE(strh(r0, MemOperand(r1, r2, PreIndex)),
+          "e1a100b2       strh r0, [r1, +r2]!");
+  COMPARE(strh(r0, MemOperand(r1, r2, NegPreIndex)),
+          "e12100b2       strh r0, [r1, -r2]!");
+
+  COMPARE(ldr(r0, MemOperand(r1)),
+          "e5910000       ldr r0, [r1, #+0]");
+  COMPARE(ldr(r2, MemOperand(r3, 42)),
+          "e593202a       ldr r2, [r3, #+42]");
+  COMPARE(ldr(r4, MemOperand(r5, -42)),
+          "e515402a       ldr r4, [r5, #-42]");
+  COMPARE(ldr(r6, MemOperand(r7, 42, PostIndex)),
+          "e497602a       ldr r6, [r7], #+42");
+  COMPARE(ldr(r8, MemOperand(r9, -42, PostIndex)),
+          "e419802a       ldr r8, [r9], #-42");
+  COMPARE(ldr(r10, MemOperand(fp, 42, PreIndex)),
+          "e5bba02a       ldr r10, [fp, #+42]!");
+  COMPARE(ldr(ip, MemOperand(sp, -42, PreIndex)),
+          "e53dc02a       ldr ip, [sp, #-42]!");
+  COMPARE(ldr(r0, MemOperand(r1, r2)),
+          "e7910002       ldr r0, [r1, +r2]");
+  COMPARE(ldr(r0, MemOperand(r1, r2, NegOffset)),
+          "e7110002       ldr r0, [r1, -r2]");
+  COMPARE(ldr(r0, MemOperand(r1, r2, PostIndex)),
+          "e6910002       ldr r0, [r1], +r2");
+  COMPARE(ldr(r0, MemOperand(r1, r2, NegPostIndex)),
+          "e6110002       ldr r0, [r1], -r2");
+  COMPARE(ldr(r0, MemOperand(r1, r2, PreIndex)),
+          "e7b10002       ldr r0, [r1, +r2]!");
+  COMPARE(ldr(r0, MemOperand(r1, r2, NegPreIndex)),
+          "e7310002       ldr r0, [r1, -r2]!");
+
+  COMPARE(str(r0, MemOperand(r1)),
+          "e5810000       str r0, [r1, #+0]");
+  COMPARE(str(r2, MemOperand(r3, 42)),
+          "e583202a       str r2, [r3, #+42]");
+  COMPARE(str(r4, MemOperand(r5, -42)),
+          "e505402a       str r4, [r5, #-42]");
+  COMPARE(str(r6, MemOperand(r7, 42, PostIndex)),
+          "e487602a       str r6, [r7], #+42");
+  COMPARE(str(r8, MemOperand(r9, -42, PostIndex)),
+          "e409802a       str r8, [r9], #-42");
+  COMPARE(str(r10, MemOperand(fp, 42, PreIndex)),
+          "e5aba02a       str r10, [fp, #+42]!");
+  COMPARE(str(ip, MemOperand(sp, -42, PreIndex)),
+          "e52dc02a       str ip, [sp, #-42]!");
+  COMPARE(str(r0, MemOperand(r1, r2)),
+          "e7810002       str r0, [r1, +r2]");
+  COMPARE(str(r0, MemOperand(r1, r2, NegOffset)),
+          "e7010002       str r0, [r1, -r2]");
+  COMPARE(str(r0, MemOperand(r1, r2, PostIndex)),
+          "e6810002       str r0, [r1], +r2");
+  COMPARE(str(r0, MemOperand(r1, r2, NegPostIndex)),
+          "e6010002       str r0, [r1], -r2");
+  COMPARE(str(r0, MemOperand(r1, r2, PreIndex)),
+          "e7a10002       str r0, [r1, +r2]!");
+  COMPARE(str(r0, MemOperand(r1, r2, NegPreIndex)),
+          "e7210002       str r0, [r1, -r2]!");
+
+  if (CpuFeatures::IsSupported(ARMv7)) {
+    CpuFeatures::Scope scope(ARMv7);
+    COMPARE(ldrd(r0, r1, MemOperand(r1)),
+            "e1c100d0       ldrd r0, [r1, #+0]");
+    COMPARE(ldrd(r2, r3, MemOperand(r3, 127)),
+            "e1c327df       ldrd r2, [r3, #+127]");
+    COMPARE(ldrd(r4, r5, MemOperand(r5, -127)),
+            "e14547df       ldrd r4, [r5, #-127]");
+    COMPARE(ldrd(r6, r7, MemOperand(r7, 127, PostIndex)),
+            "e0c767df       ldrd r6, [r7], #+127");
+    COMPARE(ldrd(r8, r9, MemOperand(r9, -127, PostIndex)),
+            "e04987df       ldrd r8, [r9], #-127");
+    COMPARE(ldrd(r10, fp, MemOperand(fp, 127, PreIndex)),
+            "e1eba7df       ldrd r10, [fp, #+127]!");
+    COMPARE(ldrd(ip, sp, MemOperand(sp, -127, PreIndex)),
+            "e16dc7df       ldrd ip, [sp, #-127]!");
+
+    COMPARE(strd(r0, r1, MemOperand(r1)),
+            "e1c100f0       strd r0, [r1, #+0]");
+    COMPARE(strd(r2, r3, MemOperand(r3, 127)),
+            "e1c327ff       strd r2, [r3, #+127]");
+    COMPARE(strd(r4, r5, MemOperand(r5, -127)),
+            "e14547ff       strd r4, [r5, #-127]");
+    COMPARE(strd(r6, r7, MemOperand(r7, 127, PostIndex)),
+            "e0c767ff       strd r6, [r7], #+127");
+    COMPARE(strd(r8, r9, MemOperand(r9, -127, PostIndex)),
+            "e04987ff       strd r8, [r9], #-127");
+    COMPARE(strd(r10, fp, MemOperand(fp, 127, PreIndex)),
+            "e1eba7ff       strd r10, [fp, #+127]!");
+    COMPARE(strd(ip, sp, MemOperand(sp, -127, PreIndex)),
+            "e16dc7ff       strd ip, [sp, #-127]!");
+  }
+
+  VERIFY_RUN();
+}
+

@@ -1,4 +1,4 @@
-// Copyright 2006-2008 the V8 project authors. All rights reserved.
+// Copyright 2011 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -29,8 +29,9 @@
 
 #include "v8.h"
 
-#include "platform.h"
 #include "cctest.h"
+#include "platform.h"
+#include "utils-inl.h"
 
 using namespace v8::internal;
 
@@ -89,8 +90,8 @@ void TestMemCopy(Vector<byte> src,
   memset(dst.start(), 0xFF, dst.length());
   byte* to = dst.start() + 32 + destination_alignment;
   byte* from = src.start() + source_alignment;
-  int length = kMinComplexMemCopy + length_alignment;
-  MemCopy(to, from, static_cast<size_t>(length));
+  int length = OS::kMinComplexMemCopy + length_alignment;
+  OS::MemCopy(to, from, static_cast<size_t>(length));
   printf("[%d,%d,%d]\n",
          source_alignment, destination_alignment, length_alignment);
   for (int i = 0; i < length; i++) {
@@ -103,7 +104,9 @@ void TestMemCopy(Vector<byte> src,
 
 
 TEST(MemCopy) {
-  const int N = kMinComplexMemCopy + 128;
+  v8::V8::Initialize();
+  OS::Setup();
+  const int N = OS::kMinComplexMemCopy + 128;
   Vector<byte> buffer1 = Vector<byte>::New(N);
   Vector<byte> buffer2 = Vector<byte>::New(N);
 
@@ -130,4 +133,77 @@ TEST(MemCopy) {
 
   buffer2.Dispose();
   buffer1.Dispose();
+}
+
+
+TEST(Collector) {
+  Collector<int> collector(8);
+  const int kLoops = 5;
+  const int kSequentialSize = 1000;
+  const int kBlockSize = 7;
+  for (int loop = 0; loop < kLoops; loop++) {
+    Vector<int> block = collector.AddBlock(7, 0xbadcafe);
+    for (int i = 0; i < kSequentialSize; i++) {
+      collector.Add(i);
+    }
+    for (int i = 0; i < kBlockSize - 1; i++) {
+      block[i] = i * 7;
+    }
+  }
+  Vector<int> result = collector.ToVector();
+  CHECK_EQ(kLoops * (kBlockSize + kSequentialSize), result.length());
+  for (int i = 0; i < kLoops; i++) {
+    int offset = i * (kSequentialSize + kBlockSize);
+    for (int j = 0; j < kBlockSize - 1; j++) {
+      CHECK_EQ(j * 7, result[offset + j]);
+    }
+    CHECK_EQ(0xbadcafe, result[offset + kBlockSize - 1]);
+    for (int j = 0; j < kSequentialSize; j++) {
+      CHECK_EQ(j, result[offset + kBlockSize + j]);
+    }
+  }
+  result.Dispose();
+}
+
+
+TEST(SequenceCollector) {
+  SequenceCollector<int> collector(8);
+  const int kLoops = 5000;
+  const int kMaxSequenceSize = 13;
+  int total_length = 0;
+  for (int loop = 0; loop < kLoops; loop++) {
+    int seq_length = loop % kMaxSequenceSize;
+    collector.StartSequence();
+    for (int j = 0; j < seq_length; j++) {
+      collector.Add(j);
+    }
+    Vector<int> sequence = collector.EndSequence();
+    for (int j = 0; j < seq_length; j++) {
+      CHECK_EQ(j, sequence[j]);
+    }
+    total_length += seq_length;
+  }
+  Vector<int> result = collector.ToVector();
+  CHECK_EQ(total_length, result.length());
+  int offset = 0;
+  for (int loop = 0; loop < kLoops; loop++) {
+    int seq_length = loop % kMaxSequenceSize;
+    for (int j = 0; j < seq_length; j++) {
+      CHECK_EQ(j, result[offset]);
+      offset++;
+    }
+  }
+  result.Dispose();
+}
+
+
+TEST(SequenceCollectorRegression) {
+  SequenceCollector<char> collector(16);
+  collector.StartSequence();
+  collector.Add('0');
+  collector.AddBlock(
+      i::Vector<const char>("12345678901234567890123456789012", 32));
+  i::Vector<char> seq = collector.EndSequence();
+  CHECK_EQ(0, strncmp("0123456789012345678901234567890123",
+                      seq.start(), seq.length()));
 }

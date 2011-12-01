@@ -1,4 +1,4 @@
-// Copyright 2010 the V8 project authors. All rights reserved.
+// Copyright 2011 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -28,23 +28,13 @@
 #include "v8.h"
 
 #include "ast.h"
-#include "data-flow.h"
 #include "parser.h"
 #include "scopes.h"
 #include "string-stream.h"
-#include "ast-inl.h"
-#include "jump-target-inl.h"
+#include "type-info.h"
 
 namespace v8 {
 namespace internal {
-
-
-VariableProxySentinel VariableProxySentinel::this_proxy_(true);
-VariableProxySentinel VariableProxySentinel::identifier_proxy_(false);
-ValidLeftHandSideSentinel ValidLeftHandSideSentinel::instance_;
-Property Property::this_property_(VariableProxySentinel::this_proxy(), NULL, 0);
-Call Call::sentinel_(NULL, NULL, 0);
-
 
 // ----------------------------------------------------------------------------
 // All the Accept member functions for each syntax tree node type.
@@ -58,38 +48,45 @@ AST_NODE_LIST(DECL_ACCEPT)
 // ----------------------------------------------------------------------------
 // Implementation of other node functionality.
 
-Assignment* ExpressionStatement::StatementAsSimpleAssignment() {
-  return (expression()->AsAssignment() != NULL &&
-          !expression()->AsAssignment()->is_compound())
-      ? expression()->AsAssignment()
-      : NULL;
+
+bool Expression::IsSmiLiteral() {
+  return AsLiteral() != NULL && AsLiteral()->handle()->IsSmi();
 }
 
 
-CountOperation* ExpressionStatement::StatementAsCountOperation() {
-  return expression()->AsCountOperation();
+bool Expression::IsStringLiteral() {
+  return AsLiteral() != NULL && AsLiteral()->handle()->IsString();
 }
 
 
-VariableProxy::VariableProxy(Handle<String> name,
+bool Expression::IsNullLiteral() {
+  return AsLiteral() != NULL && AsLiteral()->handle()->IsNull();
+}
+
+
+VariableProxy::VariableProxy(Isolate* isolate, Variable* var)
+    : Expression(isolate),
+      name_(var->name()),
+      var_(NULL),  // Will be set by the call to BindTo.
+      is_this_(var->is_this()),
+      is_trivial_(false),
+      position_(RelocInfo::kNoPosition) {
+  BindTo(var);
+}
+
+
+VariableProxy::VariableProxy(Isolate* isolate,
+                             Handle<String> name,
                              bool is_this,
-                             bool inside_with)
-  : name_(name),
-    var_(NULL),
-    is_this_(is_this),
-    inside_with_(inside_with),
-    is_trivial_(false),
-    reaching_definitions_(NULL),
-    is_primitive_(false) {
-  // names must be canonicalized for fast equality checks
+                             int position)
+    : Expression(isolate),
+      name_(name),
+      var_(NULL),
+      is_this_(is_this),
+      is_trivial_(false),
+      position_(position) {
+  // Names must be canonicalized for fast equality checks.
   ASSERT(name->IsSymbol());
-}
-
-
-VariableProxy::VariableProxy(bool is_this)
-  : is_this_(is_this),
-    reaching_definitions_(NULL),
-    is_primitive_(false) {
 }
 
 
@@ -104,6 +101,35 @@ void VariableProxy::BindTo(Variable* var) {
   // in JS. Sigh...
   var_ = var;
   var->set_is_used(true);
+}
+
+
+Assignment::Assignment(Isolate* isolate,
+                       Token::Value op,
+                       Expression* target,
+                       Expression* value,
+                       int pos)
+    : Expression(isolate),
+      op_(op),
+      target_(target),
+      value_(value),
+      pos_(pos),
+      binary_operation_(NULL),
+      compound_load_id_(kNoNumber),
+      assignment_id_(GetNextId(isolate)),
+      block_start_(false),
+      block_end_(false),
+      is_monomorphic_(false) {
+  ASSERT(Token::IsAssignmentOp(op));
+  if (is_compound()) {
+    binary_operation_ =
+        new(isolate->zone()) BinaryOperation(isolate,
+                                             binary_op(),
+                                             target,
+                                             value,
+                                             pos + 1);
+    compound_load_id_ = GetNextId(isolate);
+  }
 }
 
 
@@ -131,11 +157,27 @@ bool FunctionLiteral::AllowsLazyCompilation() {
 }
 
 
+int FunctionLiteral::start_position() const {
+  return scope()->start_position();
+}
+
+
+int FunctionLiteral::end_position() const {
+  return scope()->end_position();
+}
+
+
+LanguageMode FunctionLiteral::language_mode() const {
+  return scope()->language_mode();
+}
+
+
 ObjectLiteral::Property::Property(Literal* key, Expression* value) {
+  emit_store_ = true;
   key_ = key;
   value_ = value;
   Object* k = *key->handle();
-  if (k->IsSymbol() && Heap::Proto_symbol()->Equals(String::cast(k))) {
+  if (k->IsSymbol() && HEAP->Proto_symbol()->Equals(String::cast(k))) {
     kind_ = PROTOTYPE;
   } else if (value_->AsMaterializedLiteral() != NULL) {
     kind_ = MATERIALIZED_LITERAL;
@@ -148,7 +190,9 @@ ObjectLiteral::Property::Property(Literal* key, Expression* value) {
 
 
 ObjectLiteral::Property::Property(bool is_getter, FunctionLiteral* value) {
-  key_ = new Literal(value->name());
+  Isolate* isolate = Isolate::Current();
+  emit_store_ = true;
+  key_ = new(isolate->zone()) Literal(isolate, value->name());
   value_ = value;
   kind_ = is_getter ? GETTER : SETTER;
 }
@@ -161,88 +205,641 @@ bool ObjectLiteral::Property::IsCompileTimeValue() {
 }
 
 
-void TargetCollector::AddTarget(BreakTarget* target) {
-  // Add the label to the collector, but discard duplicates.
-  int length = targets_->length();
-  for (int i = 0; i < length; i++) {
-    if (targets_->at(i) == target) return;
-  }
-  targets_->Add(target);
+void ObjectLiteral::Property::set_emit_store(bool emit_store) {
+  emit_store_ = emit_store;
 }
 
 
-bool Expression::GuaranteedSmiResult() {
-  BinaryOperation* node = AsBinaryOperation();
-  if (node == NULL) return false;
-  Token::Value op = node->op();
-  switch (op) {
+bool ObjectLiteral::Property::emit_store() {
+  return emit_store_;
+}
+
+
+bool IsEqualString(void* first, void* second) {
+  ASSERT((*reinterpret_cast<String**>(first))->IsString());
+  ASSERT((*reinterpret_cast<String**>(second))->IsString());
+  Handle<String> h1(reinterpret_cast<String**>(first));
+  Handle<String> h2(reinterpret_cast<String**>(second));
+  return (*h1)->Equals(*h2);
+}
+
+
+bool IsEqualNumber(void* first, void* second) {
+  ASSERT((*reinterpret_cast<Object**>(first))->IsNumber());
+  ASSERT((*reinterpret_cast<Object**>(second))->IsNumber());
+
+  Handle<Object> h1(reinterpret_cast<Object**>(first));
+  Handle<Object> h2(reinterpret_cast<Object**>(second));
+  if (h1->IsSmi()) {
+    return h2->IsSmi() && *h1 == *h2;
+  }
+  if (h2->IsSmi()) return false;
+  Handle<HeapNumber> n1 = Handle<HeapNumber>::cast(h1);
+  Handle<HeapNumber> n2 = Handle<HeapNumber>::cast(h2);
+  ASSERT(isfinite(n1->value()));
+  ASSERT(isfinite(n2->value()));
+  return n1->value() == n2->value();
+}
+
+
+void ObjectLiteral::CalculateEmitStore() {
+  HashMap properties(&IsEqualString);
+  HashMap elements(&IsEqualNumber);
+  for (int i = this->properties()->length() - 1; i >= 0; i--) {
+    ObjectLiteral::Property* property = this->properties()->at(i);
+    Literal* literal = property->key();
+    Handle<Object> handle = literal->handle();
+
+    if (handle->IsNull()) {
+      continue;
+    }
+
+    uint32_t hash;
+    HashMap* table;
+    void* key;
+    Factory* factory = Isolate::Current()->factory();
+    if (handle->IsSymbol()) {
+      Handle<String> name(String::cast(*handle));
+      if (name->AsArrayIndex(&hash)) {
+        Handle<Object> key_handle = factory->NewNumberFromUint(hash);
+        key = key_handle.location();
+        table = &elements;
+      } else {
+        key = name.location();
+        hash = name->Hash();
+        table = &properties;
+      }
+    } else if (handle->ToArrayIndex(&hash)) {
+      key = handle.location();
+      table = &elements;
+    } else {
+      ASSERT(handle->IsNumber());
+      double num = handle->Number();
+      char arr[100];
+      Vector<char> buffer(arr, ARRAY_SIZE(arr));
+      const char* str = DoubleToCString(num, buffer);
+      Handle<String> name = factory->NewStringFromAscii(CStrVector(str));
+      key = name.location();
+      hash = name->Hash();
+      table = &properties;
+    }
+    // If the key of a computed property is in the table, do not emit
+    // a store for the property later.
+    if (property->kind() == ObjectLiteral::Property::COMPUTED) {
+      if (table->Lookup(key, hash, false) != NULL) {
+        property->set_emit_store(false);
+      }
+    }
+    // Add key to the table.
+    table->Lookup(key, hash, true);
+  }
+}
+
+
+void TargetCollector::AddTarget(Label* target) {
+  // Add the label to the collector, but discard duplicates.
+  int length = targets_.length();
+  for (int i = 0; i < length; i++) {
+    if (targets_[i] == target) return;
+  }
+  targets_.Add(target);
+}
+
+
+bool UnaryOperation::ResultOverwriteAllowed() {
+  switch (op_) {
+    case Token::BIT_NOT:
+    case Token::SUB:
+      return true;
+    default:
+      return false;
+  }
+}
+
+
+bool BinaryOperation::ResultOverwriteAllowed() {
+  switch (op_) {
     case Token::COMMA:
     case Token::OR:
     case Token::AND:
+      return false;
+    case Token::BIT_OR:
+    case Token::BIT_XOR:
+    case Token::BIT_AND:
+    case Token::SHL:
+    case Token::SAR:
+    case Token::SHR:
     case Token::ADD:
     case Token::SUB:
     case Token::MUL:
     case Token::DIV:
     case Token::MOD:
-    case Token::BIT_XOR:
-    case Token::SHL:
-      return false;
-      break;
-    case Token::BIT_OR:
-    case Token::BIT_AND: {
-      Literal* left = node->left()->AsLiteral();
-      Literal* right = node->right()->AsLiteral();
-      if (left != NULL && left->handle()->IsSmi()) {
-        int value = Smi::cast(*left->handle())->value();
-        if (op == Token::BIT_OR && ((value & 0xc0000000) == 0xc0000000)) {
-          // Result of bitwise or is always a negative Smi.
-          return true;
-        }
-        if (op == Token::BIT_AND && ((value & 0xc0000000) == 0)) {
-          // Result of bitwise and is always a positive Smi.
-          return true;
-        }
-      }
-      if (right != NULL && right->handle()->IsSmi()) {
-        int value = Smi::cast(*right->handle())->value();
-        if (op == Token::BIT_OR && ((value & 0xc0000000) == 0xc0000000)) {
-          // Result of bitwise or is always a negative Smi.
-          return true;
-        }
-        if (op == Token::BIT_AND && ((value & 0xc0000000) == 0)) {
-          // Result of bitwise and is always a positive Smi.
-          return true;
-        }
-      }
-      return false;
-      break;
-    }
-    case Token::SAR:
-    case Token::SHR: {
-      Literal* right = node->right()->AsLiteral();
-       if (right != NULL && right->handle()->IsSmi()) {
-        int value = Smi::cast(*right->handle())->value();
-        if ((value & 0x1F) > 1 ||
-            (op == Token::SAR && (value & 0x1F) == 1)) {
-          return true;
-        }
-       }
-       return false;
-       break;
-    }
+      return true;
     default:
       UNREACHABLE();
-      break;
   }
   return false;
 }
+
+
+static bool IsTypeof(Expression* expr) {
+  UnaryOperation* maybe_unary = expr->AsUnaryOperation();
+  return maybe_unary != NULL && maybe_unary->op() == Token::TYPEOF;
+}
+
+
+// Check for the pattern: typeof <expression> equals <string literal>.
+static bool MatchLiteralCompareTypeof(Expression* left,
+                                      Token::Value op,
+                                      Expression* right,
+                                      Expression** expr,
+                                      Handle<String>* check) {
+  if (IsTypeof(left) && right->IsStringLiteral() && Token::IsEqualityOp(op)) {
+    *expr = left->AsUnaryOperation()->expression();
+    *check = Handle<String>::cast(right->AsLiteral()->handle());
+    return true;
+  }
+  return false;
+}
+
+
+bool CompareOperation::IsLiteralCompareTypeof(Expression** expr,
+                                              Handle<String>* check) {
+  return MatchLiteralCompareTypeof(left_, op_, right_, expr, check) ||
+      MatchLiteralCompareTypeof(right_, op_, left_, expr, check);
+}
+
+
+static bool IsVoidOfLiteral(Expression* expr) {
+  UnaryOperation* maybe_unary = expr->AsUnaryOperation();
+  return maybe_unary != NULL &&
+      maybe_unary->op() == Token::VOID &&
+      maybe_unary->expression()->AsLiteral() != NULL;
+}
+
+
+// Check for the pattern: void <literal> equals <expression>
+static bool MatchLiteralCompareUndefined(Expression* left,
+                                         Token::Value op,
+                                         Expression* right,
+                                         Expression** expr) {
+  if (IsVoidOfLiteral(left) && Token::IsEqualityOp(op)) {
+    *expr = right;
+    return true;
+  }
+  return false;
+}
+
+
+bool CompareOperation::IsLiteralCompareUndefined(Expression** expr) {
+  return MatchLiteralCompareUndefined(left_, op_, right_, expr) ||
+      MatchLiteralCompareUndefined(right_, op_, left_, expr);
+}
+
+
+// Check for the pattern: null equals <expression>
+static bool MatchLiteralCompareNull(Expression* left,
+                                    Token::Value op,
+                                    Expression* right,
+                                    Expression** expr) {
+  if (left->IsNullLiteral() && Token::IsEqualityOp(op)) {
+    *expr = right;
+    return true;
+  }
+  return false;
+}
+
+
+bool CompareOperation::IsLiteralCompareNull(Expression** expr) {
+  return MatchLiteralCompareNull(left_, op_, right_, expr) ||
+      MatchLiteralCompareNull(right_, op_, left_, expr);
+}
+
+
+// ----------------------------------------------------------------------------
+// Inlining support
+
+bool Declaration::IsInlineable() const {
+  return proxy()->var()->IsStackAllocated() && fun() == NULL;
+}
+
+
+bool TargetCollector::IsInlineable() const {
+  UNREACHABLE();
+  return false;
+}
+
+
+bool ForInStatement::IsInlineable() const {
+  return false;
+}
+
+
+bool WithStatement::IsInlineable() const {
+  return false;
+}
+
+
+bool SwitchStatement::IsInlineable() const {
+  return false;
+}
+
+
+bool TryStatement::IsInlineable() const {
+  return false;
+}
+
+
+bool TryCatchStatement::IsInlineable() const {
+  return false;
+}
+
+
+bool TryFinallyStatement::IsInlineable() const {
+  return false;
+}
+
+
+bool DebuggerStatement::IsInlineable() const {
+  return false;
+}
+
+
+bool Throw::IsInlineable() const {
+  return exception()->IsInlineable();
+}
+
+
+bool MaterializedLiteral::IsInlineable() const {
+  // TODO(1322): Allow materialized literals.
+  return false;
+}
+
+
+bool FunctionLiteral::IsInlineable() const {
+  // TODO(1322): Allow materialized literals.
+  return false;
+}
+
+
+bool ThisFunction::IsInlineable() const {
+  return true;
+}
+
+
+bool SharedFunctionInfoLiteral::IsInlineable() const {
+  return false;
+}
+
+
+bool ForStatement::IsInlineable() const {
+  return (init() == NULL || init()->IsInlineable())
+      && (cond() == NULL || cond()->IsInlineable())
+      && (next() == NULL || next()->IsInlineable())
+      && body()->IsInlineable();
+}
+
+
+bool WhileStatement::IsInlineable() const {
+  return cond()->IsInlineable()
+      && body()->IsInlineable();
+}
+
+
+bool DoWhileStatement::IsInlineable() const {
+  return cond()->IsInlineable()
+      && body()->IsInlineable();
+}
+
+
+bool ContinueStatement::IsInlineable() const {
+  return true;
+}
+
+
+bool BreakStatement::IsInlineable() const {
+  return true;
+}
+
+
+bool EmptyStatement::IsInlineable() const {
+  return true;
+}
+
+
+bool Literal::IsInlineable() const {
+  return true;
+}
+
+
+bool Block::IsInlineable() const {
+  const int count = statements_.length();
+  for (int i = 0; i < count; ++i) {
+    if (!statements_[i]->IsInlineable()) return false;
+  }
+  return true;
+}
+
+
+bool ExpressionStatement::IsInlineable() const {
+  return expression()->IsInlineable();
+}
+
+
+bool IfStatement::IsInlineable() const {
+  return condition()->IsInlineable()
+      && then_statement()->IsInlineable()
+      && else_statement()->IsInlineable();
+}
+
+
+bool ReturnStatement::IsInlineable() const {
+  return expression()->IsInlineable();
+}
+
+
+bool Conditional::IsInlineable() const {
+  return condition()->IsInlineable() && then_expression()->IsInlineable() &&
+      else_expression()->IsInlineable();
+}
+
+
+bool VariableProxy::IsInlineable() const {
+  return var()->IsUnallocated()
+      || var()->IsStackAllocated()
+      || var()->IsContextSlot();
+}
+
+
+bool Assignment::IsInlineable() const {
+  return target()->IsInlineable() && value()->IsInlineable();
+}
+
+
+bool Property::IsInlineable() const {
+  return obj()->IsInlineable() && key()->IsInlineable();
+}
+
+
+bool Call::IsInlineable() const {
+  if (!expression()->IsInlineable()) return false;
+  const int count = arguments()->length();
+  for (int i = 0; i < count; ++i) {
+    if (!arguments()->at(i)->IsInlineable()) return false;
+  }
+  return true;
+}
+
+
+bool CallNew::IsInlineable() const {
+  if (!expression()->IsInlineable()) return false;
+  const int count = arguments()->length();
+  for (int i = 0; i < count; ++i) {
+    if (!arguments()->at(i)->IsInlineable()) return false;
+  }
+  return true;
+}
+
+
+bool CallRuntime::IsInlineable() const {
+  // Don't try to inline JS runtime calls because we don't (currently) even
+  // optimize them.
+  if (is_jsruntime()) return false;
+  // Don't inline the %_ArgumentsLength or %_Arguments because their
+  // implementation will not work.  There is no stack frame to get them
+  // from.
+  if (function()->intrinsic_type == Runtime::INLINE &&
+      (name()->IsEqualTo(CStrVector("_ArgumentsLength")) ||
+       name()->IsEqualTo(CStrVector("_Arguments")))) {
+    return false;
+  }
+  const int count = arguments()->length();
+  for (int i = 0; i < count; ++i) {
+    if (!arguments()->at(i)->IsInlineable()) return false;
+  }
+  return true;
+}
+
+
+bool UnaryOperation::IsInlineable() const {
+  return expression()->IsInlineable();
+}
+
+
+bool BinaryOperation::IsInlineable() const {
+  return left()->IsInlineable() && right()->IsInlineable();
+}
+
+
+bool CompareOperation::IsInlineable() const {
+  return left()->IsInlineable() && right()->IsInlineable();
+}
+
+
+bool CountOperation::IsInlineable() const {
+  return expression()->IsInlineable();
+}
+
+
+// ----------------------------------------------------------------------------
+// Recording of type feedback
+
+void Property::RecordTypeFeedback(TypeFeedbackOracle* oracle) {
+  // Record type feedback from the oracle in the AST.
+  is_monomorphic_ = oracle->LoadIsMonomorphicNormal(this);
+  receiver_types_.Clear();
+  if (key()->IsPropertyName()) {
+    if (oracle->LoadIsBuiltin(this, Builtins::kLoadIC_ArrayLength)) {
+      is_array_length_ = true;
+    } else if (oracle->LoadIsBuiltin(this, Builtins::kLoadIC_StringLength)) {
+      is_string_length_ = true;
+    } else if (oracle->LoadIsBuiltin(this,
+                                     Builtins::kLoadIC_FunctionPrototype)) {
+      is_function_prototype_ = true;
+    } else {
+      Literal* lit_key = key()->AsLiteral();
+      ASSERT(lit_key != NULL && lit_key->handle()->IsString());
+      Handle<String> name = Handle<String>::cast(lit_key->handle());
+      oracle->LoadReceiverTypes(this, name, &receiver_types_);
+    }
+  } else if (oracle->LoadIsBuiltin(this, Builtins::kKeyedLoadIC_String)) {
+    is_string_access_ = true;
+  } else if (is_monomorphic_) {
+    receiver_types_.Add(oracle->LoadMonomorphicReceiverType(this));
+  } else if (oracle->LoadIsMegamorphicWithTypeInfo(this)) {
+    receiver_types_.Reserve(kMaxKeyedPolymorphism);
+    oracle->CollectKeyedReceiverTypes(this->id(), &receiver_types_);
+  }
+}
+
+
+void Assignment::RecordTypeFeedback(TypeFeedbackOracle* oracle) {
+  Property* prop = target()->AsProperty();
+  ASSERT(prop != NULL);
+  is_monomorphic_ = oracle->StoreIsMonomorphicNormal(this);
+  receiver_types_.Clear();
+  if (prop->key()->IsPropertyName()) {
+    Literal* lit_key = prop->key()->AsLiteral();
+    ASSERT(lit_key != NULL && lit_key->handle()->IsString());
+    Handle<String> name = Handle<String>::cast(lit_key->handle());
+    oracle->StoreReceiverTypes(this, name, &receiver_types_);
+  } else if (is_monomorphic_) {
+    // Record receiver type for monomorphic keyed stores.
+    receiver_types_.Add(oracle->StoreMonomorphicReceiverType(this));
+  } else if (oracle->StoreIsMegamorphicWithTypeInfo(this)) {
+    receiver_types_.Reserve(kMaxKeyedPolymorphism);
+    oracle->CollectKeyedReceiverTypes(this->id(), &receiver_types_);
+  }
+}
+
+
+void CountOperation::RecordTypeFeedback(TypeFeedbackOracle* oracle) {
+  is_monomorphic_ = oracle->StoreIsMonomorphicNormal(this);
+  receiver_types_.Clear();
+  if (is_monomorphic_) {
+    // Record receiver type for monomorphic keyed stores.
+    receiver_types_.Add(oracle->StoreMonomorphicReceiverType(this));
+  } else if (oracle->StoreIsMegamorphicWithTypeInfo(this)) {
+    receiver_types_.Reserve(kMaxKeyedPolymorphism);
+    oracle->CollectKeyedReceiverTypes(this->id(), &receiver_types_);
+  }
+}
+
+
+void CaseClause::RecordTypeFeedback(TypeFeedbackOracle* oracle) {
+  TypeInfo info = oracle->SwitchType(this);
+  if (info.IsSmi()) {
+    compare_type_ = SMI_ONLY;
+  } else if (info.IsSymbol()) {
+    compare_type_ = SYMBOL_ONLY;
+  } else if (info.IsNonSymbol()) {
+    compare_type_ = STRING_ONLY;
+  } else if (info.IsNonPrimitive()) {
+    compare_type_ = OBJECT_ONLY;
+  } else {
+    ASSERT(compare_type_ == NONE);
+  }
+}
+
+
+static bool CanCallWithoutIC(Handle<JSFunction> target, int arity) {
+  SharedFunctionInfo* info = target->shared();
+  // If the number of formal parameters of the target function does
+  // not match the number of arguments we're passing, we don't want to
+  // deal with it. Otherwise, we can call it directly.
+  return !target->NeedsArgumentsAdaption() ||
+      info->formal_parameter_count() == arity;
+}
+
+
+bool Call::ComputeTarget(Handle<Map> type, Handle<String> name) {
+  if (check_type_ == RECEIVER_MAP_CHECK) {
+    // For primitive checks the holder is set up to point to the
+    // corresponding prototype object, i.e. one step of the algorithm
+    // below has been already performed.
+    // For non-primitive checks we clear it to allow computing targets
+    // for polymorphic calls.
+    holder_ = Handle<JSObject>::null();
+  }
+  while (true) {
+    LookupResult lookup(type->GetIsolate());
+    type->LookupInDescriptors(NULL, *name, &lookup);
+    // If the function wasn't found directly in the map, we start
+    // looking upwards through the prototype chain.
+    if (!lookup.IsFound() && type->prototype()->IsJSObject()) {
+      holder_ = Handle<JSObject>(JSObject::cast(type->prototype()));
+      type = Handle<Map>(holder()->map());
+    } else if (lookup.IsProperty() && lookup.type() == CONSTANT_FUNCTION) {
+      target_ = Handle<JSFunction>(lookup.GetConstantFunctionFromMap(*type));
+      return CanCallWithoutIC(target_, arguments()->length());
+    } else {
+      return false;
+    }
+  }
+}
+
+
+bool Call::ComputeGlobalTarget(Handle<GlobalObject> global,
+                               LookupResult* lookup) {
+  target_ = Handle<JSFunction>::null();
+  cell_ = Handle<JSGlobalPropertyCell>::null();
+  ASSERT(lookup->IsProperty() &&
+         lookup->type() == NORMAL &&
+         lookup->holder() == *global);
+  cell_ = Handle<JSGlobalPropertyCell>(global->GetPropertyCell(lookup));
+  if (cell_->value()->IsJSFunction()) {
+    Handle<JSFunction> candidate(JSFunction::cast(cell_->value()));
+    // If the function is in new space we assume it's more likely to
+    // change and thus prefer the general IC code.
+    if (!HEAP->InNewSpace(*candidate) &&
+        CanCallWithoutIC(candidate, arguments()->length())) {
+      target_ = candidate;
+      return true;
+    }
+  }
+  return false;
+}
+
+
+void Call::RecordTypeFeedback(TypeFeedbackOracle* oracle,
+                              CallKind call_kind) {
+  is_monomorphic_ = oracle->CallIsMonomorphic(this);
+  Property* property = expression()->AsProperty();
+  if (property == NULL) {
+    // Function call.  Specialize for monomorphic calls.
+    if (is_monomorphic_) target_ = oracle->GetCallTarget(this);
+  } else {
+    // Method call.  Specialize for the receiver types seen at runtime.
+    Literal* key = property->key()->AsLiteral();
+    ASSERT(key != NULL && key->handle()->IsString());
+    Handle<String> name = Handle<String>::cast(key->handle());
+    receiver_types_.Clear();
+    oracle->CallReceiverTypes(this, name, call_kind, &receiver_types_);
+#ifdef DEBUG
+    if (FLAG_enable_slow_asserts) {
+      int length = receiver_types_.length();
+      for (int i = 0; i < length; i++) {
+        Handle<Map> map = receiver_types_.at(i);
+        ASSERT(!map.is_null() && *map != NULL);
+      }
+    }
+#endif
+    check_type_ = oracle->GetCallCheckType(this);
+    if (is_monomorphic_) {
+      Handle<Map> map;
+      if (receiver_types_.length() > 0) {
+        ASSERT(check_type_ == RECEIVER_MAP_CHECK);
+        map = receiver_types_.at(0);
+      } else {
+        ASSERT(check_type_ != RECEIVER_MAP_CHECK);
+        holder_ = Handle<JSObject>(
+            oracle->GetPrototypeForPrimitiveCheck(check_type_));
+        map = Handle<Map>(holder_->map());
+      }
+      is_monomorphic_ = ComputeTarget(map, name);
+    }
+  }
+}
+
+
+void CompareOperation::RecordTypeFeedback(TypeFeedbackOracle* oracle) {
+  TypeInfo info = oracle->CompareType(this);
+  if (info.IsSmi()) {
+    compare_type_ = SMI_ONLY;
+  } else if (info.IsNonPrimitive()) {
+    compare_type_ = OBJECT_ONLY;
+  } else {
+    ASSERT(compare_type_ == NONE);
+  }
+}
+
 
 // ----------------------------------------------------------------------------
 // Implementation of AstVisitor
 
 bool AstVisitor::CheckStackOverflow() {
   if (stack_overflow_) return true;
-  StackLimitCheck check;
+  StackLimitCheck check(isolate_);
   if (!check.HasOverflowed()) return false;
   return (stack_overflow_ = true);
 }
@@ -300,8 +897,6 @@ FOR_EACH_REG_EXP_TREE_TYPE(MAKE_TYPE_CASE)
 FOR_EACH_REG_EXP_TREE_TYPE(MAKE_TYPE_CASE)
 #undef MAKE_TYPE_CASE
 
-RegExpEmpty RegExpEmpty::kInstance;
-
 
 static Interval ListCaptureRegisters(ZoneList<RegExpTree*>* children) {
   Interval result = Interval::Empty();
@@ -337,39 +932,70 @@ Interval RegExpQuantifier::CaptureRegisters() {
 }
 
 
-bool RegExpAssertion::IsAnchored() {
+bool RegExpAssertion::IsAnchoredAtStart() {
   return type() == RegExpAssertion::START_OF_INPUT;
 }
 
 
-bool RegExpAlternative::IsAnchored() {
+bool RegExpAssertion::IsAnchoredAtEnd() {
+  return type() == RegExpAssertion::END_OF_INPUT;
+}
+
+
+bool RegExpAlternative::IsAnchoredAtStart() {
   ZoneList<RegExpTree*>* nodes = this->nodes();
   for (int i = 0; i < nodes->length(); i++) {
     RegExpTree* node = nodes->at(i);
-    if (node->IsAnchored()) { return true; }
+    if (node->IsAnchoredAtStart()) { return true; }
     if (node->max_match() > 0) { return false; }
   }
   return false;
 }
 
 
-bool RegExpDisjunction::IsAnchored() {
+bool RegExpAlternative::IsAnchoredAtEnd() {
+  ZoneList<RegExpTree*>* nodes = this->nodes();
+  for (int i = nodes->length() - 1; i >= 0; i--) {
+    RegExpTree* node = nodes->at(i);
+    if (node->IsAnchoredAtEnd()) { return true; }
+    if (node->max_match() > 0) { return false; }
+  }
+  return false;
+}
+
+
+bool RegExpDisjunction::IsAnchoredAtStart() {
   ZoneList<RegExpTree*>* alternatives = this->alternatives();
   for (int i = 0; i < alternatives->length(); i++) {
-    if (!alternatives->at(i)->IsAnchored())
+    if (!alternatives->at(i)->IsAnchoredAtStart())
       return false;
   }
   return true;
 }
 
 
-bool RegExpLookahead::IsAnchored() {
-  return is_positive() && body()->IsAnchored();
+bool RegExpDisjunction::IsAnchoredAtEnd() {
+  ZoneList<RegExpTree*>* alternatives = this->alternatives();
+  for (int i = 0; i < alternatives->length(); i++) {
+    if (!alternatives->at(i)->IsAnchoredAtEnd())
+      return false;
+  }
+  return true;
 }
 
 
-bool RegExpCapture::IsAnchored() {
-  return body()->IsAnchored();
+bool RegExpLookahead::IsAnchoredAtStart() {
+  return is_positive() && body()->IsAnchoredAtStart();
+}
+
+
+bool RegExpCapture::IsAnchoredAtStart() {
+  return body()->IsAnchoredAtStart();
+}
+
+
+bool RegExpCapture::IsAnchoredAtEnd() {
+  return body()->IsAnchoredAtEnd();
 }
 
 
@@ -382,7 +1008,7 @@ class RegExpUnparser: public RegExpVisitor {
  public:
   RegExpUnparser();
   void VisitCharacterRange(CharacterRange that);
-  SmartPointer<const char> ToString() { return stream_.ToCString(); }
+  SmartArrayPointer<const char> ToString() { return stream_.ToCString(); }
 #define MAKE_CASE(Name) virtual void* Visit##Name(RegExp##Name*, void* data);
   FOR_EACH_REG_EXP_TREE_TYPE(MAKE_CASE)
 #undef MAKE_CASE
@@ -537,7 +1163,7 @@ void* RegExpUnparser::VisitEmpty(RegExpEmpty* that, void* data) {
 }
 
 
-SmartPointer<const char> RegExpTree::ToString() {
+SmartArrayPointer<const char> RegExpTree::ToString() {
   RegExpUnparser unparser;
   Accept(&unparser, NULL);
   return unparser.ToString();
@@ -575,578 +1201,17 @@ RegExpAlternative::RegExpAlternative(ZoneList<RegExpTree*>* nodes)
   }
 }
 
-// IsPrimitive implementation.  IsPrimitive is true if the value of an
-// expression is known at compile-time to be any JS type other than Object
-// (e.g, it is Undefined, Null, Boolean, String, or Number).
 
-// The following expression types are never primitive because they express
-// Object values.
-bool FunctionLiteral::IsPrimitive() { return false; }
-bool SharedFunctionInfoLiteral::IsPrimitive() { return false; }
-bool RegExpLiteral::IsPrimitive() { return false; }
-bool ObjectLiteral::IsPrimitive() { return false; }
-bool ArrayLiteral::IsPrimitive() { return false; }
-bool CatchExtensionObject::IsPrimitive() { return false; }
-bool CallNew::IsPrimitive() { return false; }
-bool ThisFunction::IsPrimitive() { return false; }
-
-
-// The following expression types are not always primitive because we do not
-// have enough information to conclude that they are.
-bool Property::IsPrimitive() { return false; }
-bool Call::IsPrimitive() { return false; }
-bool CallRuntime::IsPrimitive() { return false; }
-
-
-// A variable use is not primitive unless the primitive-type analysis
-// determines otherwise.
-bool VariableProxy::IsPrimitive() {
-  ASSERT(!is_primitive_ || (var() != NULL && var()->IsStackAllocated()));
-  return is_primitive_;
+CaseClause::CaseClause(Isolate* isolate,
+                       Expression* label,
+                       ZoneList<Statement*>* statements,
+                       int pos)
+    : label_(label),
+      statements_(statements),
+      position_(pos),
+      compare_type_(NONE),
+      compare_id_(AstNode::GetNextId(isolate)),
+      entry_id_(AstNode::GetNextId(isolate)) {
 }
-
-// The value of a conditional is the value of one of the alternatives.  It's
-// always primitive if both alternatives are always primitive.
-bool Conditional::IsPrimitive() {
-  return then_expression()->IsPrimitive() && else_expression()->IsPrimitive();
-}
-
-
-// A literal is primitive when it is not a JSObject.
-bool Literal::IsPrimitive() { return !handle()->IsJSObject(); }
-
-
-// The value of an assignment is the value of its right-hand side.
-bool Assignment::IsPrimitive() {
-  switch (op()) {
-    case Token::INIT_VAR:
-    case Token::INIT_CONST:
-    case Token::ASSIGN:
-      return value()->IsPrimitive();
-
-    default:
-      // {|=, ^=, &=, <<=, >>=, >>>=, +=, -=, *=, /=, %=}
-      // Arithmetic operations are always primitive.  They express Numbers
-      // with the exception of +, which expresses a Number or a String.
-      return true;
-  }
-}
-
-
-// Throw does not express a value, so it's trivially always primitive.
-bool Throw::IsPrimitive() { return true; }
-
-
-// Unary operations always express primitive values.  delete and ! express
-// Booleans, void Undefined, typeof String, +, -, and ~ Numbers.
-bool UnaryOperation::IsPrimitive() { return true; }
-
-
-// Count operations (pre- and post-fix increment and decrement) always
-// express primitive values (Numbers).  See ECMA-262-3, 11.3.1, 11.3.2,
-// 11.4.4, ane 11.4.5.
-bool CountOperation::IsPrimitive() { return true; }
-
-
-// Binary operations depend on the operator.
-bool BinaryOperation::IsPrimitive() {
-  switch (op()) {
-    case Token::COMMA:
-      // Value is the value of the right subexpression.
-      return right()->IsPrimitive();
-
-    case Token::OR:
-    case Token::AND:
-      // Value is the value one of the subexpressions.
-      return left()->IsPrimitive() && right()->IsPrimitive();
-
-    default:
-      // {|, ^, &, <<, >>, >>>, +, -, *, /, %}
-      // Arithmetic operations are always primitive.  They express Numbers
-      // with the exception of +, which expresses a Number or a String.
-      return true;
-  }
-}
-
-
-// Compare operations always express Boolean values.
-bool CompareOperation::IsPrimitive() { return true; }
-
-
-// Overridden IsCritical member functions.  IsCritical is true for AST nodes
-// whose evaluation is absolutely required (they are never dead) because
-// they are externally visible.
-
-// References to global variables or lookup slots are critical because they
-// may have getters.  All others, including parameters rewritten to explicit
-// property references, are not critical.
-bool VariableProxy::IsCritical() {
-  Variable* var = AsVariable();
-  return var != NULL &&
-      (var->slot() == NULL || var->slot()->type() == Slot::LOOKUP);
-}
-
-
-// Literals are never critical.
-bool Literal::IsCritical() { return false; }
-
-
-// Property assignments and throwing of reference errors are always
-// critical.  Assignments to escaping variables are also critical.  In
-// addition the operation of compound assignments is critical if either of
-// its operands is non-primitive (the arithmetic operations all use one of
-// ToPrimitive, ToNumber, ToInt32, or ToUint32 on each of their operands).
-// In this case, we mark the entire AST node as critical because there is
-// no binary operation node to mark.
-bool Assignment::IsCritical() {
-  Variable* var = AssignedVariable();
-  return var == NULL ||
-      !var->IsStackAllocated() ||
-      (is_compound() && (!target()->IsPrimitive() || !value()->IsPrimitive()));
-}
-
-
-// Property references are always critical, because they may have getters.
-bool Property::IsCritical() { return true; }
-
-
-// Calls are always critical.
-bool Call::IsCritical() { return true; }
-
-
-// +,- use ToNumber on the value of their operand.
-bool UnaryOperation::IsCritical() {
-  ASSERT(op() == Token::ADD || op() == Token::SUB);
-  return !expression()->IsPrimitive();
-}
-
-
-// Count operations targeting properties and reference errors are always
-// critical.  Count operations on escaping variables are critical.  Count
-// operations targeting non-primitives are also critical because they use
-// ToNumber.
-bool CountOperation::IsCritical() {
-  Variable* var = AssignedVariable();
-  return var == NULL ||
-      !var->IsStackAllocated() ||
-      !expression()->IsPrimitive();
-}
-
-
-// Arithmetic operations all use one of ToPrimitive, ToNumber, ToInt32, or
-// ToUint32 on each of their operands.
-bool BinaryOperation::IsCritical() {
-  ASSERT(op() != Token::COMMA);
-  ASSERT(op() != Token::OR);
-  ASSERT(op() != Token::AND);
-  return !left()->IsPrimitive() || !right()->IsPrimitive();
-}
-
-
-// <, >, <=, and >= all use ToPrimitive on both their operands.
-bool CompareOperation::IsCritical() {
-  ASSERT(op() != Token::EQ);
-  ASSERT(op() != Token::NE);
-  ASSERT(op() != Token::EQ_STRICT);
-  ASSERT(op() != Token::NE_STRICT);
-  ASSERT(op() != Token::INSTANCEOF);
-  ASSERT(op() != Token::IN);
-  return !left()->IsPrimitive() || !right()->IsPrimitive();
-}
-
-
-// Implementation of a copy visitor. The visitor create a deep copy
-// of ast nodes. Nodes that do not require a deep copy are copied
-// with the default copy constructor.
-
-AstNode::AstNode(AstNode* other) : num_(kNoNumber) {
-  // AST node number should be unique. Assert that we only copy AstNodes
-  // before node numbers are assigned.
-  ASSERT(other->num_ == kNoNumber);
-}
-
-
-Statement::Statement(Statement* other)
-    : AstNode(other), statement_pos_(other->statement_pos_) {}
-
-
-Expression::Expression(Expression* other)
-    : AstNode(other),
-      bitfields_(other->bitfields_),
-      type_(other->type_) {}
-
-
-BreakableStatement::BreakableStatement(BreakableStatement* other)
-    : Statement(other), labels_(other->labels_), type_(other->type_) {}
-
-
-Block::Block(Block* other, ZoneList<Statement*>* statements)
-    : BreakableStatement(other),
-      statements_(statements->length()),
-      is_initializer_block_(other->is_initializer_block_) {
-  statements_.AddAll(*statements);
-}
-
-
-WhileStatement::WhileStatement(ZoneStringList* labels)
-    : IterationStatement(labels),
-      cond_(NULL),
-      may_have_function_literal_(true) {
-}
-
-
-ExpressionStatement::ExpressionStatement(ExpressionStatement* other,
-                                         Expression* expression)
-    : Statement(other), expression_(expression) {}
-
-
-IfStatement::IfStatement(IfStatement* other,
-                         Expression* condition,
-                         Statement* then_statement,
-                         Statement* else_statement)
-    : Statement(other),
-      condition_(condition),
-      then_statement_(then_statement),
-      else_statement_(else_statement) {}
-
-
-EmptyStatement::EmptyStatement(EmptyStatement* other) : Statement(other) {}
-
-
-IterationStatement::IterationStatement(IterationStatement* other,
-                                       Statement* body)
-    : BreakableStatement(other), body_(body) {}
-
-
-CaseClause::CaseClause(Expression* label, ZoneList<Statement*>* statements)
-    : label_(label), statements_(statements) {
-}
-
-
-ForStatement::ForStatement(ForStatement* other,
-                           Statement* init,
-                           Expression* cond,
-                           Statement* next,
-                           Statement* body)
-    : IterationStatement(other, body),
-      init_(init),
-      cond_(cond),
-      next_(next),
-      may_have_function_literal_(other->may_have_function_literal_),
-      loop_variable_(other->loop_variable_),
-      peel_this_loop_(other->peel_this_loop_) {}
-
-
-Assignment::Assignment(Assignment* other,
-                       Expression* target,
-                       Expression* value)
-    : Expression(other),
-      op_(other->op_),
-      target_(target),
-      value_(value),
-      pos_(other->pos_),
-      block_start_(other->block_start_),
-      block_end_(other->block_end_) {}
-
-
-Property::Property(Property* other, Expression* obj, Expression* key)
-    : Expression(other),
-      obj_(obj),
-      key_(key),
-      pos_(other->pos_),
-      type_(other->type_) {}
-
-
-Call::Call(Call* other,
-           Expression* expression,
-           ZoneList<Expression*>* arguments)
-    : Expression(other),
-      expression_(expression),
-      arguments_(arguments),
-      pos_(other->pos_) {}
-
-
-UnaryOperation::UnaryOperation(UnaryOperation* other, Expression* expression)
-    : Expression(other), op_(other->op_), expression_(expression) {}
-
-
-BinaryOperation::BinaryOperation(Expression* other,
-                                 Token::Value op,
-                                 Expression* left,
-                                 Expression* right)
-    : Expression(other), op_(op), left_(left), right_(right) {}
-
-
-CountOperation::CountOperation(CountOperation* other, Expression* expression)
-    : Expression(other),
-      is_prefix_(other->is_prefix_),
-      op_(other->op_),
-      expression_(expression) {}
-
-
-CompareOperation::CompareOperation(CompareOperation* other,
-                                   Expression* left,
-                                   Expression* right)
-    : Expression(other),
-      op_(other->op_),
-      left_(left),
-      right_(right) {}
-
-
-Expression* CopyAstVisitor::DeepCopyExpr(Expression* expr) {
-  expr_ = NULL;
-  if (expr != NULL) Visit(expr);
-  return expr_;
-}
-
-
-Statement* CopyAstVisitor::DeepCopyStmt(Statement* stmt) {
-  stmt_ = NULL;
-  if (stmt != NULL) Visit(stmt);
-  return stmt_;
-}
-
-
-ZoneList<Expression*>* CopyAstVisitor::DeepCopyExprList(
-    ZoneList<Expression*>* expressions) {
-  ZoneList<Expression*>* copy =
-      new ZoneList<Expression*>(expressions->length());
-  for (int i = 0; i < expressions->length(); i++) {
-    copy->Add(DeepCopyExpr(expressions->at(i)));
-  }
-  return copy;
-}
-
-
-ZoneList<Statement*>* CopyAstVisitor::DeepCopyStmtList(
-    ZoneList<Statement*>* statements) {
-  ZoneList<Statement*>* copy = new ZoneList<Statement*>(statements->length());
-  for (int i = 0; i < statements->length(); i++) {
-    copy->Add(DeepCopyStmt(statements->at(i)));
-  }
-  return copy;
-}
-
-
-void CopyAstVisitor::VisitBlock(Block* stmt) {
-  stmt_ = new Block(stmt,
-                    DeepCopyStmtList(stmt->statements()));
-}
-
-
-void CopyAstVisitor::VisitExpressionStatement(
-    ExpressionStatement* stmt) {
-  stmt_ = new ExpressionStatement(stmt, DeepCopyExpr(stmt->expression()));
-}
-
-
-void CopyAstVisitor::VisitEmptyStatement(EmptyStatement* stmt) {
-  stmt_ = new EmptyStatement(stmt);
-}
-
-
-void CopyAstVisitor::VisitIfStatement(IfStatement* stmt) {
-  stmt_ = new IfStatement(stmt,
-                          DeepCopyExpr(stmt->condition()),
-                          DeepCopyStmt(stmt->then_statement()),
-                          DeepCopyStmt(stmt->else_statement()));
-}
-
-
-void CopyAstVisitor::VisitContinueStatement(ContinueStatement* stmt) {
-  SetStackOverflow();
-}
-
-
-void CopyAstVisitor::VisitBreakStatement(BreakStatement* stmt) {
-  SetStackOverflow();
-}
-
-
-void CopyAstVisitor::VisitReturnStatement(ReturnStatement* stmt) {
-  SetStackOverflow();
-}
-
-
-void CopyAstVisitor::VisitWithEnterStatement(
-    WithEnterStatement* stmt) {
-  SetStackOverflow();
-}
-
-
-void CopyAstVisitor::VisitWithExitStatement(WithExitStatement* stmt) {
-  SetStackOverflow();
-}
-
-
-void CopyAstVisitor::VisitSwitchStatement(SwitchStatement* stmt) {
-  SetStackOverflow();
-}
-
-
-void CopyAstVisitor::VisitDoWhileStatement(DoWhileStatement* stmt) {
-  SetStackOverflow();
-}
-
-
-void CopyAstVisitor::VisitWhileStatement(WhileStatement* stmt) {
-  SetStackOverflow();
-}
-
-
-void CopyAstVisitor::VisitForStatement(ForStatement* stmt) {
-  stmt_ = new ForStatement(stmt,
-                           DeepCopyStmt(stmt->init()),
-                           DeepCopyExpr(stmt->cond()),
-                           DeepCopyStmt(stmt->next()),
-                           DeepCopyStmt(stmt->body()));
-}
-
-
-void CopyAstVisitor::VisitForInStatement(ForInStatement* stmt) {
-  SetStackOverflow();
-}
-
-
-void CopyAstVisitor::VisitTryCatchStatement(TryCatchStatement* stmt) {
-  SetStackOverflow();
-}
-
-
-void CopyAstVisitor::VisitTryFinallyStatement(
-    TryFinallyStatement* stmt) {
-  SetStackOverflow();
-}
-
-
-void CopyAstVisitor::VisitDebuggerStatement(
-    DebuggerStatement* stmt) {
-  SetStackOverflow();
-}
-
-
-void CopyAstVisitor::VisitFunctionLiteral(FunctionLiteral* expr) {
-  SetStackOverflow();
-}
-
-
-void CopyAstVisitor::VisitSharedFunctionInfoLiteral(
-    SharedFunctionInfoLiteral* expr) {
-  SetStackOverflow();
-}
-
-
-void CopyAstVisitor::VisitConditional(Conditional* expr) {
-  SetStackOverflow();
-}
-
-
-void CopyAstVisitor::VisitSlot(Slot* expr) {
-  UNREACHABLE();
-}
-
-
-void CopyAstVisitor::VisitVariableProxy(VariableProxy* expr) {
-  expr_ = new VariableProxy(*expr);
-}
-
-
-void CopyAstVisitor::VisitLiteral(Literal* expr) {
-  expr_ = new Literal(*expr);
-}
-
-
-void CopyAstVisitor::VisitRegExpLiteral(RegExpLiteral* expr) {
-  SetStackOverflow();
-}
-
-
-void CopyAstVisitor::VisitObjectLiteral(ObjectLiteral* expr) {
-  SetStackOverflow();
-}
-
-
-void CopyAstVisitor::VisitArrayLiteral(ArrayLiteral* expr) {
-  SetStackOverflow();
-}
-
-
-void CopyAstVisitor::VisitCatchExtensionObject(
-    CatchExtensionObject* expr) {
-  SetStackOverflow();
-}
-
-
-void CopyAstVisitor::VisitAssignment(Assignment* expr) {
-  expr_ = new Assignment(expr,
-                         DeepCopyExpr(expr->target()),
-                         DeepCopyExpr(expr->value()));
-}
-
-
-void CopyAstVisitor::VisitThrow(Throw* expr) {
-  SetStackOverflow();
-}
-
-
-void CopyAstVisitor::VisitProperty(Property* expr) {
-  expr_ = new Property(expr,
-                       DeepCopyExpr(expr->obj()),
-                       DeepCopyExpr(expr->key()));
-}
-
-
-void CopyAstVisitor::VisitCall(Call* expr) {
-  expr_ = new Call(expr,
-                   DeepCopyExpr(expr->expression()),
-                   DeepCopyExprList(expr->arguments()));
-}
-
-
-void CopyAstVisitor::VisitCallNew(CallNew* expr) {
-  SetStackOverflow();
-}
-
-
-void CopyAstVisitor::VisitCallRuntime(CallRuntime* expr) {
-  SetStackOverflow();
-}
-
-
-void CopyAstVisitor::VisitUnaryOperation(UnaryOperation* expr) {
-  expr_ = new UnaryOperation(expr, DeepCopyExpr(expr->expression()));
-}
-
-
-void CopyAstVisitor::VisitCountOperation(CountOperation* expr) {
-  expr_ = new CountOperation(expr,
-                             DeepCopyExpr(expr->expression()));
-}
-
-
-void CopyAstVisitor::VisitBinaryOperation(BinaryOperation* expr) {
-  expr_ = new BinaryOperation(expr,
-                              expr->op(),
-                              DeepCopyExpr(expr->left()),
-                              DeepCopyExpr(expr->right()));
-}
-
-
-void CopyAstVisitor::VisitCompareOperation(CompareOperation* expr) {
-  expr_ = new CompareOperation(expr,
-                               DeepCopyExpr(expr->left()),
-                               DeepCopyExpr(expr->right()));
-}
-
-
-void CopyAstVisitor::VisitThisFunction(ThisFunction* expr) {
-  SetStackOverflow();
-}
-
-
-void CopyAstVisitor::VisitDeclaration(Declaration* decl) {
-  UNREACHABLE();
-}
-
 
 } }  // namespace v8::internal
